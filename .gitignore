@@ -19,3 +19,6 @@ __pycache__/
 # Local configuration
 .env
 EOF
+evolution_3d_minima.gif
+evolutionary_stagnation_3d.gif
+test.py

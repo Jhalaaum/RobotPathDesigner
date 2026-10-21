@@ -9,10 +9,13 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsLineItem,
-    QGraphicsTextItem
+    QGraphicsTextItem,
+    QFileDialog,
+    QGraphicsPixmapItem
 )
-from PySide6.QtGui import QPen, QBrush, QColor, QPainter
-from PySide6.QtCore import Qt
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap
+from PySide6.QtCore import Qt, QSize
 
 
 class Waypoint(QGraphicsEllipseItem):
@@ -26,7 +29,7 @@ class Waypoint(QGraphicsEllipseItem):
 
         self.setPen(QPen(QColor("blue")))
         self.setBrush(QBrush(QColor("blue")))
-        self.setZValue(2)
+        self.setZValue(3)
 
         self.setFlag(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
@@ -60,11 +63,11 @@ class PathSegment(QGraphicsLineItem):
         self.pixels_per_cm = pixels_per_cm
 
         self.setPen(QPen(QColor("blue"), 2))
-        self.setZValue(0)
+        self.setZValue(1)
 
         self.distance_label = QGraphicsTextItem(self)
         self.distance_label.setDefaultTextColor(QColor("red"))
-        self.distance_label.setZValue(1)
+        self.distance_label.setZValue(2)
 
         self.start_waypoint.connected_segments.append(self)
         self.end_waypoint.connected_segments.append(self)
@@ -115,21 +118,21 @@ class PathSegment(QGraphicsLineItem):
 class RobotCanvas(QGraphicsView):
     def __init__(self):
         super().__init__()
-
+        
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
 
         self.setWindowTitle("Robot Path Designer")
-        self.resize(900, 650)
+        self.resize(1600, 774)
 
         self.next_waypoint_id = 0
         self.waypoints = []
         self.segments = []
 
-        self.pixels_per_cm = 5
+        self.pixels_per_cm = 0.67739204064
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.scene.setSceneRect(0, 0, 850, 600)
+        self.scene.setSceneRect(0, 0, 1600, 774)
 
         self.zoom_level = 1.0
         self.min_zoom = 0.25
@@ -138,7 +141,7 @@ class RobotCanvas(QGraphicsView):
         self.setTransformationAnchor(
             QGraphicsView.ViewportAnchor.AnchorUnderMouse
         )
-
+        self.background = None
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
@@ -169,6 +172,8 @@ class RobotCanvas(QGraphicsView):
                 self.zoom_level = new_zoom
 
             event.accept()
+        elif event.key() == Qt.Key.Key_I:
+            self.importField()
 
         else:
             super().keyPressEvent(event)
@@ -198,8 +203,7 @@ class RobotCanvas(QGraphicsView):
 
         if isinstance(item, Waypoint):
             return super().mousePressEvent(event)
-
-        if item is not None:
+        if item is not None and isinstance(item, QGraphicsPixmapItem)==False:
             return super().mousePressEvent(event)
 
         scene_pos = self.mapToScene(viewport_pos)
@@ -224,6 +228,48 @@ class RobotCanvas(QGraphicsView):
 
             self.segments.append(pathsegment)
             self.scene.addItem(pathsegment)
+    def importField(self):
+        file_path, selected_filter = QFileDialog.getOpenFileName(self, "Import WRO Field", "", "PDF Files (*.pdf)")
+        if file_path:
+            document = QPdfDocument(self)
+            error = document.load(file_path)
+            print(error)
+
+            if error != QPdfDocument.Error.None_ or document.pageCount() < 1:
+                print("Failed to load PDF")
+                return
+
+            print(document.pageCount())
+            dimensions = document.pagePointSize(0)
+
+            if dimensions.width() <= 0 or dimensions.height() <= 0:
+                print("Invalid PDF dimensions")
+                return
+
+            render_width = 1600
+            render_height = round(render_width * dimensions.height() / dimensions.width())
+            image_size = QSize(render_width, render_height)
+            image = document.render(0, image_size)
+
+            if image.isNull():
+                print("Failed to render PDF")
+                return
+
+            pixmap = QPixmap.fromImage(image)
+            item = QGraphicsPixmapItem(pixmap)
+            item.setZValue(0)
+
+            if self.background is not None:
+                self.scene.removeItem(self.background)
+
+            self.background = item
+            self.scene.addItem(item)
+            self.scene.setSceneRect(self.scene.itemsBoundingRect())
+
+            self.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
+            self.zoom_level = self.transform().m11()
+        else:
+            print("No file selected")
 
     def deleteWaypoint(self, item):
         index = self.waypoints.index(item)

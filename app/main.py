@@ -106,8 +106,9 @@ class PathSegment(QGraphicsLineItem):
             midpoint_x - label_width / 2,
             midpoint_y - 25
         )
-
-
+    def disconnect(self):
+        self.start_waypoint.connected_segments.remove(self)
+        self.end_waypoint.connected_segments.remove(self)
 class RobotCanvas(QGraphicsView):
     def __init__(self):
         super().__init__()
@@ -132,9 +133,10 @@ class RobotCanvas(QGraphicsView):
 
             for item in selected_items:
                 if isinstance(item, Waypoint):
-                    id = item.waypoint_id
-                    print(item)
-                    a = self.deleteWaypoint(item, id)
+                    copy_of_connected_segments = list(item.connected_segments)
+                    for segment in copy_of_connected_segments:
+                        self.removeSegment(segment)
+                    self.deleteWaypoint(item)
 
         else:
             super().keyPressEvent(event)
@@ -173,9 +175,25 @@ class RobotCanvas(QGraphicsView):
 
             self.segments.append(pathsegment)
             self.scene.addItem(pathsegment)
-    def deleteWaypoint(self, item, waypoint_id):
+    def deleteWaypoint(self, item):
+        index = self.waypoints.index(item)
         self.waypoints.remove(item)
-        self.scene.deleteItem(item)
+        self.scene.removeItem(item)
+        self.reconnectSegments(index)
+    def removeSegment(self, segment):
+        segment.disconnect()
+        self.segments.remove(segment)
+        self.scene.removeItem(segment)
+    def reconnectSegments(self, index):
+        if len(self.waypoints) > 1:
+            print(len(self.waypoints))
+            if index != 0 and index != (len(self.waypoints)):
+                pathsegment = PathSegment(self.waypoints[index-1], self.waypoints[index], self.pixels_per_cm)
+                self.segments.insert(index-1, pathsegment)
+                self.scene.addItem(pathsegment)
+                print(self.segments)
+            
+        
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = RobotCanvas()

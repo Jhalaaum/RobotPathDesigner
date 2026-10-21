@@ -126,7 +126,18 @@ class RobotCanvas(QGraphicsView):
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.scene.setSceneRect(0, 0, 850, 600)
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            selected_items = self.scene.selectedItems()
 
+            for item in selected_items:
+                if isinstance(item, Waypoint):
+                    id = item.waypoint_id
+                    print(item)
+                    a = self.deleteWaypoint(item, id)
+
+        else:
+            super().keyPressEvent(event)
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
@@ -162,8 +173,9 @@ class RobotCanvas(QGraphicsView):
 
             self.segments.append(pathsegment)
             self.scene.addItem(pathsegment)
-
-
+    def deleteWaypoint(self, item, waypoint_id):
+        self.waypoints.remove(item)
+        self.scene.deleteItem(item)
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = RobotCanvas()

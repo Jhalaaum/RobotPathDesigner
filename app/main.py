@@ -106,9 +106,12 @@ class PathSegment(QGraphicsLineItem):
             midpoint_x - label_width / 2,
             midpoint_y - 25
         )
+
     def disconnect(self):
         self.start_waypoint.connected_segments.remove(self)
         self.end_waypoint.connected_segments.remove(self)
+
+
 class RobotCanvas(QGraphicsView):
     def __init__(self):
         super().__init__()
@@ -127,6 +130,15 @@ class RobotCanvas(QGraphicsView):
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.scene.setSceneRect(0, 0, 850, 600)
+
+        self.zoom_level = 1.0
+        self.min_zoom = 0.25
+        self.max_zoom = 4.0
+
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
@@ -137,9 +149,46 @@ class RobotCanvas(QGraphicsView):
                     for segment in copy_of_connected_segments:
                         self.removeSegment(segment)
                     self.deleteWaypoint(item)
+        elif event.key() == Qt.Key.Key_Plus:
+            zoom_factor = 1.1
+
+            new_zoom = self.zoom_level * zoom_factor
+
+            if self.min_zoom <= new_zoom <= self.max_zoom:
+                self.scale(zoom_factor, zoom_factor)
+                self.zoom_level = new_zoom
+
+            event.accept()
+        elif event.key() == Qt.Key.Key_Minus:
+            zoom_factor = 1/1.1
+
+            new_zoom = self.zoom_level * zoom_factor
+
+            if self.min_zoom <= new_zoom <= self.max_zoom:
+                self.scale(zoom_factor, zoom_factor)
+                self.zoom_level = new_zoom
+
+            event.accept()
 
         else:
             super().keyPressEvent(event)
+    """ Wheel Scrolling commented out"""
+    # def wheelEvent(self, event):
+    #     delta = event.angleDelta().y()
+
+    #     if delta == 0:
+    #         return
+
+    #     zoom_factor = 1.1 if delta > 0 else 1 / 1.1
+
+    #     new_zoom = self.zoom_level * zoom_factor
+
+    #     if self.min_zoom <= new_zoom <= self.max_zoom:
+    #         self.scale(zoom_factor, zoom_factor)
+    #         self.zoom_level = new_zoom
+
+    #     event.accept()
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
@@ -175,15 +224,18 @@ class RobotCanvas(QGraphicsView):
 
             self.segments.append(pathsegment)
             self.scene.addItem(pathsegment)
+
     def deleteWaypoint(self, item):
         index = self.waypoints.index(item)
         self.waypoints.remove(item)
         self.scene.removeItem(item)
         self.reconnectSegments(index)
+
     def removeSegment(self, segment):
         segment.disconnect()
         self.segments.remove(segment)
         self.scene.removeItem(segment)
+
     def reconnectSegments(self, index):
         if len(self.waypoints) > 1:
             print(len(self.waypoints))
@@ -192,8 +244,8 @@ class RobotCanvas(QGraphicsView):
                 self.segments.insert(index-1, pathsegment)
                 self.scene.addItem(pathsegment)
                 print(self.segments)
-            
-        
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = RobotCanvas()

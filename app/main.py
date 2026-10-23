@@ -11,11 +11,17 @@ from PySide6.QtWidgets import (
     QGraphicsLineItem,
     QGraphicsTextItem,
     QFileDialog,
-    QGraphicsPixmapItem
+    QGraphicsPixmapItem,
+    QToolBar,
+    QMainWindow,
+    QDockWidget,
+    QWidget, 
+    QVBoxLayout, 
+    QLabel
 )
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup
+from PySide6.QtCore import Qt, QSize, Signal
 
 
 class Waypoint(QGraphicsEllipseItem):
@@ -73,6 +79,11 @@ class PathSegment(QGraphicsLineItem):
         self.end_waypoint.connected_segments.append(self)
 
         self.updateGeometry()
+        self.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable,
+            True
+        )
+
 
     def updateGeometry(self):
         start_pos = self.start_waypoint.scenePos()
@@ -97,7 +108,9 @@ class PathSegment(QGraphicsLineItem):
         )
 
         distance_cm = distance_pixels / self.pixels_per_cm
-
+        
+        self.distance = distance_cm
+        
         self.distance_label.setPlainText(f"{distance_cm:.1f} cm")
 
         midpoint_x = (start_pos.x() + end_pos.x()) / 2
@@ -116,6 +129,7 @@ class PathSegment(QGraphicsLineItem):
 
 
 class RobotCanvas(QGraphicsView):
+    itemSelected = Signal(object)
     def __init__(self):
         super().__init__()
         
@@ -138,10 +152,24 @@ class RobotCanvas(QGraphicsView):
         self.min_zoom = 0.25
         self.max_zoom = 4.0
 
-        self.setTransformationAnchor(
-            QGraphicsView.ViewportAnchor.AnchorUnderMouse
-        )
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.current_tool = "select"
         self.background = None
+        self.scene.selectionChanged.connect(self.onSelectionChanged)
+    def onSelectionChanged(self):
+        selected_items = self.scene.selectedItems()
+
+        if not selected_items:
+            self.itemSelected.emit(None)
+
+        for item in selected_items:
+            if isinstance(item, Waypoint):
+                self.itemSelected.emit(item)
+                print("Selected waypoint:", item.waypoint_id)
+
+            elif isinstance(item, PathSegment):
+                self.itemSelected.emit(item)
+                print(f"{item.start_waypoint, item.end_waypoint}")
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
@@ -200,9 +228,13 @@ class RobotCanvas(QGraphicsView):
 
         viewport_pos = event.position().toPoint()
         item = self.itemAt(viewport_pos)
-
+        if self.current_tool == "select":
+            return super().mousePressEvent(event)
         if isinstance(item, Waypoint):
             return super().mousePressEvent(event)
+        if isinstance(item, PathSegment):
+            return super().mousePressEvent(event)
+
         if item is not None and isinstance(item, QGraphicsPixmapItem)==False:
             return super().mousePressEvent(event)
 
@@ -290,10 +322,83 @@ class RobotCanvas(QGraphicsView):
                 self.segments.insert(index-1, pathsegment)
                 self.scene.addItem(pathsegment)
                 print(self.segments)
+    def setTool(self, tool):
+        self.current_tool = tool
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Robot Path Designer")
+        self.resize(1600, 774)
+
+        self.canvas = RobotCanvas()
+        self.canvas.itemSelected.connect(self.updateProperties)
+
+        self.setCentralWidget(self.canvas)
+
+        properties_widget = QWidget()
+        properties_layout = QVBoxLayout()
+        self.properties_dock = QDockWidget("Properties", self)
+        properties_widget.setLayout(properties_layout)
+        self.selected_label = QLabel("Selected Item: None")
+        properties_layout.addWidget(self.selected_label)
+        self.distance_label = QLabel("Distance: ")
+        properties_layout.addWidget(self.distance_label)
+        self.movement_label = QLabel("Movement Type: ")
+        properties_layout.addWidget(self.movement_label)
+        self.properties_dock.setWidget(properties_widget)
+        properties_layout.addStretch()
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.properties_dock)
+
+        file_menu = self.menuBar().addMenu("File")
+
+        import_action = QAction("Import Field", self)
+        import_action.triggered.connect(self.canvas.importField)
+        file_menu.addAction(import_action)
+
+        toolbar = QToolBar("Main Toolbar", self)
+        self.addToolBar(toolbar)
+
+        toolbar.addAction(import_action)
+
+        tool_group = QActionGroup(self)
+        tool_group.setExclusive(True)
+
+        select_action = QAction("Select", self)
+        select_action.setCheckable(True)
+        select_action.setChecked(True)
+        select_action.triggered.connect(lambda: self.canvas.setTool("select"))
+
+        waypoint_action = QAction("Add Waypoint", self)
+        waypoint_action.setCheckable(True)
+        waypoint_action.triggered.connect(lambda: self.canvas.setTool("waypoint"))
+
+        tool_group.addAction(select_action)
+        tool_group.addAction(waypoint_action)
+
+        toolbar.addAction(select_action)
+        toolbar.addAction(waypoint_action)
+
+    def updateProperties(self, item):
+        if isinstance(item, Waypoint):
+            id = item.waypoint_id
+            self.selected_label.setText(f"Selected Item: Waypoint {id}")
+            self.distance_label.setText("Distance: —")
+            self.movement_label.setText("Movement Type: —")
+        if isinstance(item, PathSegment):
+            self.selected_label.setText(f"Selected Item: Path Segment connected from {item.start_waypoint.waypoint_id} to {item.end_waypoint.waypoint_id}")
+            self.distance_label.setText(f"Distance: {item.distance:.1f} cm")
+            self.movement_label.setText("Movement Type: —")
+        if item is None:
+            self.selected_label.setText("Selected Item: None")
+            self.distance_label.setText("Distance: —")
+            self.movement_label.setText("Movement Type: —")
+
+
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = RobotCanvas()
+    window = MainWindow()
     window.show()
     sys.exit(app.exec())

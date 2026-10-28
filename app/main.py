@@ -56,6 +56,8 @@ class Waypoint(QGraphicsEllipseItem):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for segment in self.connected_segments:
                 segment.updateGeometry()
+            if self.scene() is not None:
+                self.scene().parent().geometryChanged.emit(segment)
 
         return super().itemChange(change, value)
 
@@ -130,6 +132,7 @@ class PathSegment(QGraphicsLineItem):
 
 class RobotCanvas(QGraphicsView):
     itemSelected = Signal(object)
+    geometryChanged = Signal(object)
     def __init__(self):
         super().__init__()
         
@@ -156,6 +159,7 @@ class RobotCanvas(QGraphicsView):
         self.current_tool = "select"
         self.background = None
         self.scene.selectionChanged.connect(self.onSelectionChanged)
+        self.geometryChanged.connect(self.onSelectionChanged)
     def onSelectionChanged(self):
         selected_items = self.scene.selectedItems()
 
@@ -384,7 +388,7 @@ class MainWindow(QMainWindow):
             id = item.waypoint_id
             self.selected_label.setText(f"Selected Item: Waypoint {id}")
             self.distance_label.setText("Distance: —")
-            self.movement_label.setText("Movement Type: —")
+            self.movement_label.setText(f"Position Coordinates: X: {item.scenePos().x():.1f}, Y: {item.scenePos().y():.1f}")
         if isinstance(item, PathSegment):
             self.selected_label.setText(f"Selected Item: Path Segment connected from {item.start_waypoint.waypoint_id} to {item.end_waypoint.waypoint_id}")
             self.distance_label.setText(f"Distance: {item.distance:.1f} cm")

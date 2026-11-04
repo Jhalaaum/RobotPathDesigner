@@ -17,11 +17,37 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QWidget, 
     QVBoxLayout, 
-    QLabel
+    QLabel,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QGraphicsRectItem
 )
+
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, Signal, QSignalBlocker
+
+class Robot:
+    def __init__(self, width, length, wheel_diameter, axle_track, initial_heading=0):
+        self.width = width
+        self.length = length
+        self.wheel_diameter = wheel_diameter
+        self.axle_track = axle_track
+        self.initial_heading = initial_heading
+
+class RobotRectangle(QGraphicsRectItem):
+    def __init__(self, robot, pixels_per_mm):
+        super().__init__()
+        width_scene = robot.width * pixels_per_mm
+        length_scene = robot.length * pixels_per_mm
+
+        self.setRect(-width_scene / 2, -length_scene / 2, width_scene, length_scene)
+        self.setPen(QPen(QColor("darkgreen"), 2))
+        self.setBrush(QBrush(QColor(0, 180, 0, 70)))
+        self.setZValue(4)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
 
 
 class Waypoint(QGraphicsEllipseItem):
@@ -37,18 +63,9 @@ class Waypoint(QGraphicsEllipseItem):
         self.setBrush(QBrush(QColor("blue")))
         self.setZValue(3)
 
-        self.setFlag(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
-            True
-        )
-        self.setFlag(
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable,
-            True
-        )
-        self.setFlag(
-            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges,
-            True
-        )
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
         self.setPos(x, y)
 
@@ -57,18 +74,18 @@ class Waypoint(QGraphicsEllipseItem):
             for segment in self.connected_segments:
                 segment.updateGeometry()
             if self.scene() is not None:
-                self.scene().parent().geometryChanged.emit(segment)
+                self.scene().parent().geometryChanged.emit(self)
 
         return super().itemChange(change, value)
 
 
 class PathSegment(QGraphicsLineItem):
-    def __init__(self, start_waypoint, end_waypoint, pixels_per_cm):
+    def __init__(self, start_waypoint, end_waypoint, pixels_per_mm):
         super().__init__()
 
         self.start_waypoint = start_waypoint
         self.end_waypoint = end_waypoint
-        self.pixels_per_cm = pixels_per_cm
+        self.pixels_per_mm = pixels_per_mm
 
         self.setPen(QPen(QColor("blue"), 2))
         self.setZValue(1)
@@ -99,6 +116,7 @@ class PathSegment(QGraphicsLineItem):
         )
 
         self.calculateDistance()
+        self.calculateHeading()
 
     def calculateDistance(self):
         start_pos = self.start_waypoint.scenePos()
@@ -109,7 +127,7 @@ class PathSegment(QGraphicsLineItem):
             end_pos.y() - start_pos.y()
         )
 
-        distance_cm = distance_pixels / self.pixels_per_cm
+        distance_cm = distance_pixels / self.pixels_per_mm / 10
         
         self.distance = distance_cm
         
@@ -128,7 +146,17 @@ class PathSegment(QGraphicsLineItem):
     def disconnect(self):
         self.start_waypoint.connected_segments.remove(self)
         self.end_waypoint.connected_segments.remove(self)
+    def calculateHeading(self):
+        start = self.start_waypoint.scenePos()
+        end = self.end_waypoint.scenePos()
+        dy = end.y() - start.y()
+        dx = end.x() - start.x()
+        if dx == 0 and dy == 0:
+            self.angle_degrees = None
+            return
 
+        angle_radians = math.atan2(dy, dx)
+        self.angle_degrees = math.degrees(angle_radians)
 
 class RobotCanvas(QGraphicsView):
     itemSelected = Signal(object)
@@ -146,8 +174,11 @@ class RobotCanvas(QGraphicsView):
         self.waypoints = []
         self.segments = []
 
-        self.pixels_per_cm = 0.67739204064
-
+        self.pixels_per_mm = 0.67739204064
+        self.robot = Robot(width=250, length=250, wheel_diameter=56, axle_track=120)
+        self.robot_item = RobotRectangle(self.robot, self.pixels_per_mm)
+        self.scene.addItem(self.robot_item)
+        self.robot_item.setPos(400, 300)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.scene.setSceneRect(0, 0, 1600, 774)
 
@@ -169,11 +200,11 @@ class RobotCanvas(QGraphicsView):
         for item in selected_items:
             if isinstance(item, Waypoint):
                 self.itemSelected.emit(item)
-                print("Selected waypoint:", item.waypoint_id)
+                # print("Selected waypoint:", item.waypoint_id)
 
             elif isinstance(item, PathSegment):
                 self.itemSelected.emit(item)
-                print(f"{item.start_waypoint, item.end_waypoint}")
+                # print(f"{item.start_waypoint, item.end_waypoint}")
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
@@ -259,7 +290,7 @@ class RobotCanvas(QGraphicsView):
             pathsegment = PathSegment(
                 self.waypoints[-2],
                 self.waypoints[-1],
-                self.pixels_per_cm
+                self.pixels_per_mm
             )
 
             self.segments.append(pathsegment)
@@ -322,12 +353,22 @@ class RobotCanvas(QGraphicsView):
         if len(self.waypoints) > 1:
             print(len(self.waypoints))
             if index != 0 and index != (len(self.waypoints)):
-                pathsegment = PathSegment(self.waypoints[index-1], self.waypoints[index], self.pixels_per_cm)
+                pathsegment = PathSegment(self.waypoints[index-1], self.waypoints[index], self.pixels_per_mm)
                 self.segments.insert(index-1, pathsegment)
                 self.scene.addItem(pathsegment)
                 print(self.segments)
     def setTool(self, tool):
         self.current_tool = tool
+    def calculateTurn(self, waypoint):
+        if waypoint not in self.waypoints or waypoint == self.waypoints[0] or waypoint == self.waypoints[-1]:
+            return None
+        previous_segment = next((segment for segment in waypoint.connected_segments if segment.end_waypoint is waypoint), None)
+        next_segment = next((segment for segment in waypoint.connected_segments if segment.start_waypoint is waypoint), None)
+        if previous_segment is None or next_segment is None:
+            return None
+        if previous_segment.angle_degrees is None or next_segment.angle_degrees is None:
+            return None
+        return (next_segment.angle_degrees - previous_segment.angle_degrees + 180) % 360 - 180
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -345,12 +386,38 @@ class MainWindow(QMainWindow):
         self.properties_dock = QDockWidget("Properties", self)
         properties_widget.setLayout(properties_layout)
         self.selected_label = QLabel("Selected Item: None")
+        self.selected_label.setWordWrap(True)
         properties_layout.addWidget(self.selected_label)
         self.distance_label = QLabel("Distance: ")
         properties_layout.addWidget(self.distance_label)
+        self.angle_label = QLabel("Angle: ")
+        properties_layout.addWidget(self.angle_label)
+        self.turn_label = QLabel("Turn: —")
+        properties_layout.addWidget(self.turn_label)
         self.movement_label = QLabel("Movement Type: ")
         properties_layout.addWidget(self.movement_label)
+
+        position_group = QGroupBox("Waypoint Position")
+        position_layout = QFormLayout()
+        self.x_input = QDoubleSpinBox()
+        self.x_input.setRange(-1000000, 1000000)
+        self.x_input.setDecimals(2)
+        self.x_input.setSuffix(" scene units")
+        self.x_input.setEnabled(False)
+        self.y_input = QDoubleSpinBox()
+        self.y_input.setRange(-1000000, 1000000)
+        self.y_input.setDecimals(2)
+        self.y_input.setSuffix(" scene units")
+        self.y_input.setEnabled(False)
+        position_layout.addRow("X:", self.x_input)
+        position_layout.addRow("Y:", self.y_input)
+        position_group.setLayout(position_layout)
+        properties_layout.addWidget(position_group)
+        self.x_input.valueChanged.connect(self.updateWaypointPosition)
+        self.y_input.valueChanged.connect(self.updateWaypointPosition)
+
         self.properties_dock.setWidget(properties_widget)
+        self.properties_dock.setMinimumWidth(280)
         properties_layout.addStretch()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.properties_dock)
 
@@ -388,15 +455,35 @@ class MainWindow(QMainWindow):
             id = item.waypoint_id
             self.selected_label.setText(f"Selected Item: Waypoint {id}")
             self.distance_label.setText("Distance: —")
+            self.angle_label.setText("Heading: —")
+            turn = self.canvas.calculateTurn(item)
+            self.turn_label.setText(f"Turn: {turn:.1f}°" if turn is not None else "Turn: —")
             self.movement_label.setText(f"Position Coordinates: X: {item.scenePos().x():.1f}, Y: {item.scenePos().y():.1f}")
+            with QSignalBlocker(self.x_input), QSignalBlocker(self.y_input):
+                self.x_input.setValue(item.scenePos().x())
+                self.y_input.setValue(item.scenePos().y())
+            self.x_input.setEnabled(True)
+            self.y_input.setEnabled(True)
         if isinstance(item, PathSegment):
             self.selected_label.setText(f"Selected Item: Path Segment connected from {item.start_waypoint.waypoint_id} to {item.end_waypoint.waypoint_id}")
             self.distance_label.setText(f"Distance: {item.distance:.1f} cm")
+            self.angle_label.setText(f"Heading: {item.angle_degrees:.1f}°" if item.angle_degrees is not None else "Heading: Undefined")
+            self.turn_label.setText("Turn: —")
             self.movement_label.setText("Movement Type: —")
         if item is None:
             self.selected_label.setText("Selected Item: None")
             self.distance_label.setText("Distance: —")
+            self.angle_label.setText("Heading: —")
+            self.turn_label.setText("Turn: —")
             self.movement_label.setText("Movement Type: —")
+        if not isinstance(item, Waypoint):
+            self.x_input.setEnabled(False)
+            self.y_input.setEnabled(False)
+
+    def updateWaypointPosition(self):
+        selected_items = self.canvas.scene.selectedItems()
+        if len(selected_items) == 1 and isinstance(selected_items[0], Waypoint):
+            selected_items[0].setPos(self.x_input.value(), self.y_input.value())
 
 
 

@@ -1,6 +1,8 @@
 
 import sys
 import math
+import ast
+from types import SimpleNamespace
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,15 +24,180 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QGraphicsPolygonItem,
+    QGraphicsPathItem,
     QPushButton,
     QSpinBox,
     QComboBox,
-    QScrollArea
+    QScrollArea,
+    QCheckBox,
+    QSlider,
+    QDialog,
+    QHBoxLayout,
+    QTextEdit,
+    QMessageBox
 )
 
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup, QPolygonF, QImage
+from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup, QPolygonF, QImage, QPainterPath
 from PySide6.QtCore import Qt, QSize, Signal, QSignalBlocker, QPointF, QTimer, QElapsedTimer
+
+def generatePybricksRoute(waypoints, segments, robot):
+    """Generate minimal movement calls for pasting into the existing Pybricks main.py."""
+    warnings = []
+    errors = []
+    if len(waypoints) < 2:
+        return "", warnings, ["Add at least two waypoints before exporting."]
+    if len(segments) != len(waypoints) - 1:
+        errors.append("The route must contain exactly one segment between each consecutive waypoint.")
+    ordered_segments = []
+    for index in range(len(waypoints) - 1):
+        segment = next((item for item in segments if item.start_waypoint is waypoints[index] and item.end_waypoint is waypoints[index + 1]), None)
+        if segment is None:
+            errors.append(f"Missing segment from waypoint {waypoints[index].waypoint_id} to {waypoints[index + 1].waypoint_id}.")
+        ordered_segments.append(segment)
+    if errors:
+        return "", warnings, errors
+
+    if abs(robot.wheel_diameter - 62.4) > 0.1 or abs(robot.axle_track - 190) > 0.1:
+        warnings.append("Robot dimensions in the planner differ from the competition-day code (wheel 62.4 mm, axle 190 mm).")
+
+    calls = []
+    heading = float(robot.initial_heading)
+    def angle_difference(a, b):
+        return (a - b + 180.0) % 360.0 - 180.0
+    def format_number(number):
+        return str(int(round(number))) if abs(number - round(number)) < 0.00001 else f"{number:.2f}".rstrip("0").rstrip(".")
+
+    for index, segment in enumerate(ordered_segments):
+        start = waypoints[index]
+        end = waypoints[index + 1]
+        distance_mm = float(segment.distance) * 10.0
+        signed_distance_mm = -distance_mm if segment.reverse else distance_mm
+        path_heading = float(segment.angle_degrees) if segment.angle_degrees is not None else heading
+        target_heading = (path_heading + 180.0) % 360.0 if segment.reverse else path_heading
+        route_delta = angle_difference(target_heading, heading)
+        incoming = ordered_segments[index - 1] if index else None
+        if start.turn_override_enabled:
+            requested = float(start.turn_angle_deg)
+        elif incoming is not None and incoming.movement_type == "Line Follow (PID)" and incoming.line_stop == "Intersection" and start.intersection_direction != "Follow Route":
+            requested = {"Left": -90.0, "Right": 90.0, "Straight": 0.0}[start.intersection_direction]
+        else:
+            requested = route_delta
+        clip = max(0.0, float(start.turn_clip_deg))
+        clipped = max(-clip, min(clip, requested))
+        if abs(clipped - requested) > 0.1:
+            warnings.append(f"Waypoint {start.waypoint_id}: requested turn clipped from {requested:g} to {clipped:g} degrees.")
+        if abs(clipped - route_delta) > 5:
+            warnings.append(f"Waypoint {start.waypoint_id}: turn differs from the drawn route; check robot orientation.")
+        if abs(clipped) >= 0.05:
+            calls.append(f"turn({format_number(clipped)})")
+        heading = target_heading
+
+        if segment.movement_type == "Drive Straight":
+            if distance_mm >= 0.5:
+                calls.append(f"gyroDriveStraight({format_number(signed_distance_mm)})")
+            else:
+                warnings.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has negligible distance.")
+        elif segment.movement_type == "Line Follow (PID)":
+            if segment.line_side not in ("left", "right"):
+                errors.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has an unknown line side.")
+                continue
+            if segment.line_side == "left":
+                side_argument = 'side="left"'
+            else:
+                side_argument = ""
+            if segment.line_stop == "Distance":
+                arguments = format_number(signed_distance_mm) + (", " + side_argument if side_argument else "")
+                calls.append(f"singleLineTrackByDist({arguments})")
+            elif segment.line_stop == "Intersection":
+                if int(end.intersection_count) != 1:
+                    errors.append(f"Waypoint {end.waypoint_id} requests intersection #{end.intersection_count}, but the Pybricks helper stops at the first intersection.")
+                calls.append(f"singleLineTrackTillIntersection({side_argument})" if side_argument else "singleLineTrackTillIntersection()")
+                warnings.append(f"Waypoint {end.waypoint_id}: no automatic post-detection sensor-to-centre advance is exported; add a calibrated movement before turning if needed.")
+            else:
+                errors.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has an unknown line stop.")
+            if float(segment.ki) != 0 or abs(float(segment.kp) - 4.0) > 0.001 or abs(float(segment.kd) - 8.0) > 0.001 or abs(float(segment.line_target) - 48.5) > 0.001:
+                warnings.append(f"Segment {start.waypoint_id}->{end.waypoint_id}: custom PID/reflectance settings are not exported; existing robot constants apply.")
+            if abs(float(segment.speed_mm_s) - 200.0) > 0.001:
+                warnings.append(f"Segment {start.waypoint_id}->{end.waypoint_id}: planner speed is not exported; the robot helper's default speed applies.")
+        else:
+            errors.append(f"Segment {start.waypoint_id}->{end.waypoint_id}: unsupported movement {segment.movement_type!r}.")
+
+    final = waypoints[-1]
+    if final.turn_override_enabled and abs(float(final.turn_angle_deg)) > 0.05:
+        angle = max(-float(final.turn_clip_deg), min(float(final.turn_clip_deg), float(final.turn_angle_deg)))
+        calls.append(f"turn({format_number(angle)})")
+    warnings.append("The output contains only movement calls; paste them into your existing Pybricks program after its helper definitions.")
+    code = "\n".join(calls) + "\n"
+    try:
+        compile(code, "<minimal_pybricks_route>", "exec")
+    except SyntaxError as exc:
+        errors.append(f"Generated Python syntax error: {exc}")
+    return code, warnings, errors
+
+def parsePybricksRoute(code, intersection_distance_mm=200.0, auto_intersections=False):
+    """Parse a restricted sequence of Pybricks movement calls. Never execute pasted code."""
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise ValueError(f"Python syntax error on line {exc.lineno}: {exc.msg}") from exc
+    movements = []
+    warnings = []
+    permitted = {"gyroDriveStraight", "motorDriveStraight", "turn", "singleLineTrackByDist", "singleLineTrackTillIntersection"}
+    def number(node, line):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            result = float(node.value)
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            result = number(node.operand, line) * (-1 if isinstance(node.op, ast.USub) else 1)
+        else:
+            raise ValueError(f"Line {line}: movement values must be numeric literals, not expressions or variables.")
+        if not math.isfinite(result):
+            raise ValueError(f"Line {line}: non-finite number is not supported.")
+        return result
+    for statement in tree.body:
+        if isinstance(statement, ast.Pass):
+            continue
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call) or not isinstance(statement.value.func, ast.Name):
+            raise ValueError(f"Line {statement.lineno}: paste only movement calls (no imports, loops, assignments, or function definitions).")
+        call = statement.value
+        name = call.func.id
+        if name not in permitted:
+            raise ValueError(f"Line {statement.lineno}: unsupported command {name}(). Supported: {', '.join(sorted(permitted))}.")
+        allowed_kwargs = {"side"} if name.startswith("singleLineTrack") else set()
+        if len(call.args) > (0 if name == "singleLineTrackTillIntersection" else 1):
+            raise ValueError(f"Line {statement.lineno}: too many positional arguments for {name}().")
+        kwargs = {}
+        for kw in call.keywords:
+            if kw.arg not in allowed_kwargs or kw.arg in kwargs:
+                raise ValueError(f"Line {statement.lineno}: unsupported or duplicate argument {kw.arg!r}.")
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
+                raise ValueError(f"Line {statement.lineno}: side must be 'left' or 'right'.")
+            kwargs[kw.arg] = kw.value.value
+        side = kwargs.get("side", "right")
+        if side not in ("left", "right"):
+            raise ValueError(f"Line {statement.lineno}: side must be 'left' or 'right'.")
+        if name != "singleLineTrackTillIntersection" and not call.args:
+            raise ValueError(f"Line {statement.lineno}: {name}() requires a distance or angle.")
+        value = number(call.args[0], statement.lineno) if call.args else None
+        if name == "turn":
+            movements.append({"type": "turn", "angle": value})
+        elif name == "singleLineTrackTillIntersection":
+            if intersection_distance_mm <= 0:
+                raise ValueError("Intersection display distance must be positive.")
+            movements.append({"type": "line", "distance": float(intersection_distance_mm), "stop": "Intersection", "side": side, "estimated": True, "source_line": statement.lineno, "auto_detect": bool(auto_intersections)})
+            if not auto_intersections:
+                warnings.append(f"Line {statement.lineno}: intersection distance is unknown; displaying an estimated {intersection_distance_mm:g} mm segment. Adjust the waypoint on the field.")
+        else:
+            if abs(value) < 0.001:
+                warnings.append(f"Line {statement.lineno}: zero-distance movement omitted.")
+                continue
+            movement_type = "line" if name == "singleLineTrackByDist" else "straight"
+            movements.append({"type": movement_type, "distance": value, "stop": "Distance", "side": side, "estimated": False})
+    if not movements:
+        raise ValueError("No usable movement calls found.")
+    if not any(m["type"] != "turn" for m in movements):
+        raise ValueError("At least one drive or line-track command is needed to draw a route.")
+    return movements, warnings
 
 class Robot:
     def __init__(self, width, length, wheel_diameter, axle_track, initial_heading=0):
@@ -248,6 +415,9 @@ class Waypoint(QGraphicsEllipseItem):
         self.connected_segments = []
         self.intersection_count = 1
         self.intersection_direction = "Follow Route"
+        self.turn_override_enabled = False
+        self.turn_angle_deg = 0.0
+        self.turn_clip_deg = 180.0
 
         self.setPen(QPen(QColor("blue")))
         self.setBrush(QBrush(QColor("blue")))
@@ -258,6 +428,13 @@ class Waypoint(QGraphicsEllipseItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
         self.setPos(x, y)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.scene() is not None:
+            canvas = self.scene().parent()
+            if canvas.auto_snap_intersections:
+                canvas.snapWaypointToIntersection(self, quiet=True)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -285,6 +462,8 @@ class PathSegment(QGraphicsLineItem):
         self.kd = 8.0
         self.line_side = "right"
         self.line_stop = "Distance"
+        self.reverse = False
+        self.imported_estimate = False
 
         self.setPen(QPen(QColor("blue"), 2))
         self.setZValue(1)
@@ -304,7 +483,10 @@ class PathSegment(QGraphicsLineItem):
 
 
     def updateMovementAppearance(self):
-        self.setPen(QPen(QColor("darkgreen") if self.movement_type == "Line Follow (PID)" else QColor("blue"), 2))
+        pen = QPen(QColor("darkgreen") if self.movement_type == "Line Follow (PID)" else QColor("blue"), 2)
+        if self.reverse:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen)
 
     def updateGeometry(self):
         start_pos = self.start_waypoint.scenePos()
@@ -367,6 +549,7 @@ class RobotCanvas(QGraphicsView):
     previewFinished = Signal()
     previewStopped = Signal()
     sensorReading = Signal(str)
+    debugUpdated = Signal(object)
     def __init__(self):
         super().__init__()
         
@@ -381,6 +564,7 @@ class RobotCanvas(QGraphicsView):
         self.segments = []
 
         self.pixels_per_mm = 0.67739204064
+        self.show_coordinate_grid = True
         self.robot = Robot(width=250, length=250, wheel_diameter=56, axle_track=120)
         self.robot_item = RobotPolygon(self.robot, self.pixels_per_mm)
         self.scene.addItem(self.robot_item)
@@ -420,6 +604,20 @@ class RobotCanvas(QGraphicsView):
         self.preview_turn_target = self.robot.initial_heading
         self.preview_drive_start = QPointF()
         self.preview_speed_mm_s = 200.0
+        self.preview_speed_multiplier = 1.0
+        self.debug_left_dps = None
+        self.debug_right_dps = None
+        self.debug_error = None
+        self.debug_target = None
+        self.debug_status = "Ready"
+        self.debug_elapsed = 0.0
+        self.trail_enabled = True
+        self.trail_path = QPainterPath()
+        self.trail_item = QGraphicsPathItem()
+        self.trail_item.setPen(QPen(QColor(218, 60, 205, 220), 2))
+        self.trail_item.setZValue(2.7)
+        self.trail_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.scene.addItem(self.trail_item)
         self.preview_turn_speed_deg_s = 180.0
         self.line_last_error = 0.0
         self.line_integral = 0.0
@@ -452,6 +650,8 @@ class RobotCanvas(QGraphicsView):
         self.background_image = None
         self.track_debug_enabled = False
         self.track_debug_item = None
+        self.track_mask = None
+        self.auto_snap_intersections = True
         self.scene.selectionChanged.connect(self.onSelectionChanged)
         self.geometryChanged.connect(self.onSelectionChanged)
     def onSelectionChanged(self):
@@ -521,6 +721,160 @@ class RobotCanvas(QGraphicsView):
     #         self.zoom_level = new_zoom
 
     #     event.accept()
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if not getattr(self, "show_coordinate_grid", False) or not self.waypoints:
+            return
+        origin = self.waypoints[0].scenePos()
+        spacing = self.pixels_per_mm * 100.0
+        if spacing <= 0:
+            return
+        painter.save()
+        painter.setPen(QPen(QColor(60, 100, 150, 85), 0))
+        left_index = max(-100, math.floor((rect.left() - origin.x()) / spacing))
+        right_index = min(100, math.ceil((rect.right() - origin.x()) / spacing))
+        top_index = max(-100, math.floor((rect.top() - origin.y()) / spacing))
+        bottom_index = min(100, math.ceil((rect.bottom() - origin.y()) / spacing))
+        for i in range(left_index, right_index + 1):
+            x = origin.x() + i * spacing
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+        for i in range(top_index, bottom_index + 1):
+            y = origin.y() + i * spacing
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        painter.setPen(QPen(QColor(25, 90, 170, 190), 0))
+        painter.drawLine(QPointF(origin.x(), rect.top()), QPointF(origin.x(), rect.bottom()))
+        painter.drawLine(QPointF(rect.left(), origin.y()), QPointF(rect.right(), origin.y()))
+        painter.drawText(QPointF(origin.x() + 7, origin.y() - 7), "(0, 0) mm")
+        painter.restore()
+
+    def locateNextImportedIntersection(self, start_scene, heading_deg, side, max_distance_mm=2600.0):
+        """Find the nearest T/+ junction in the forward corridor of a code-imported line track.
+
+        Uses the existing PDF dark-pixel mask and junction classifier; it does not
+        execute Pybricks code or alter the field image. Designed for straight approaches.
+        """
+        if self.background is None or self.background_image is None or self.buildIntersectionMask() is None:
+            return None
+        angle = math.radians(heading_deg)
+        fx, fy = math.cos(angle), math.sin(angle)
+        rx, ry = -fy, fx
+        # Sample ahead of the sensor, whose mounting position may not coincide
+        # with the robot centre. Junctions must still lie on the incoming track.
+        sensor_offset = QPointF((fx * self.robot.sensor_x_mm + rx * self.robot.sensor_y_mm) * self.pixels_per_mm, (fy * self.robot.sensor_x_mm + ry * self.robot.sensor_y_mm) * self.pixels_per_mm)
+        sensor_start = start_scene + sensor_offset
+        image_bounds = self.background.sceneBoundingRect()
+        seen = set()
+        candidates = []
+        for distance_mm in range(45, int(max_distance_mm) + 1, 90):
+            probe = sensor_start + QPointF(fx * distance_mm * self.pixels_per_mm, fy * distance_mm * self.pixels_per_mm)
+            if not image_bounds.contains(probe):
+                break
+            junction = self.findIntersectionNear(probe, radius_mm=62.0)
+            if junction is None:
+                continue
+            diff = junction - start_scene
+            forward_mm = (diff.x() * fx + diff.y() * fy) / self.pixels_per_mm
+            lateral_mm = (-diff.x() * fy + diff.y() * fx) / self.pixels_per_mm
+            # Keep the junction on the forward approach, not an adjacent black
+            # line or a previous junction immediately behind the robot's sensor.
+            if forward_mm < max(35.0, self.robot.sensor_x_mm * 0.25) or abs(lateral_mm - self.robot.sensor_y_mm) > 85.0:
+                continue
+            key = (round(junction.x() / 14), round(junction.y() / 14))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((forward_mm, abs(lateral_mm - self.robot.sensor_y_mm), junction))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        for _, _, junction in candidates:
+            incoming = SimpleNamespace(start_waypoint=SimpleNamespace(scenePos=lambda: start_scene), line_side=side)
+            aligned = self.edgeAlignedWaypointPosition(junction, incoming)
+            if aligned is None:
+                continue
+            delta = aligned - start_scene
+            forward = (delta.x() * fx + delta.y() * fy) / self.pixels_per_mm
+            lateral = (-delta.x() * fy + delta.y() * fx) / self.pixels_per_mm
+            if forward >= 25 and abs(lateral) < 100:
+                return aligned
+        return None
+
+    def resolveImportedIntersections(self, movements, origin_scene=None, initial_heading=None):
+        """Resolve code-imported intersection stops before modifying the route."""
+        origin = QPointF(origin_scene if origin_scene is not None else (self.waypoints[0].scenePos() if self.waypoints else self.robot_item.scenePos()))
+        heading = float(self.robot.initial_heading if initial_heading is None else initial_heading)
+        position = QPointF(origin)
+        warnings = []
+        for movement in movements:
+            if movement["type"] == "turn":
+                heading += movement["angle"]
+                continue
+            if movement.get("auto_detect") and movement.get("stop") == "Intersection":
+                found = self.locateNextImportedIntersection(position, heading, movement["side"])
+                if found is None:
+                    warnings.append(f"Line {movement.get('source_line', '?')}: no confident forward junction; used {movement['distance']:g} mm fallback. Place the start/heading on the correct track, or adjust the waypoint manually.")
+                else:
+                    movement["target_scene"] = QPointF(found)
+                    movement["distance"] = math.hypot(found.x() - position.x(), found.y() - position.y()) / self.pixels_per_mm
+                    movement["estimated"] = False
+            if "target_scene" in movement:
+                position = QPointF(movement["target_scene"])
+            else:
+                radians = math.radians(heading)
+                position += QPointF(math.cos(radians) * movement["distance"] * self.pixels_per_mm, math.sin(radians) * movement["distance"] * self.pixels_per_mm)
+        return warnings
+
+    def loadRouteMovements(self, movements, origin_scene=None, initial_heading=None):
+        """Replace the editable route from parsed calls (millimetres, heading in screen degrees)."""
+        self.resetRobotPreview()
+        if origin_scene is None:
+            origin_scene = self.waypoints[0].scenePos() if self.waypoints else self.robot_item.scenePos()
+        if initial_heading is None:
+            initial_heading = self.robot.initial_heading
+        for segment in list(self.segments):
+            self.removeSegment(segment)
+        for waypoint in list(self.waypoints):
+            self.scene.removeItem(waypoint)
+        self.waypoints.clear()
+        self.next_waypoint_id = 0
+        self.robot.initial_heading = float(initial_heading)
+        self.robot_item.setRotation(float(initial_heading))
+        position = QPointF(origin_scene)
+        heading = float(initial_heading)
+        def add_waypoint(pos):
+            wp = Waypoint(self.next_waypoint_id, pos.x(), pos.y())
+            self.next_waypoint_id += 1
+            self.waypoints.append(wp)
+            self.scene.addItem(wp)
+            return wp
+        current = add_waypoint(position)
+        for move in movements:
+            if move["type"] == "turn":
+                angle = move["angle"]
+                current.turn_override_enabled = True
+                current.turn_angle_deg += angle
+                current.turn_clip_deg = max(180.0, abs(current.turn_angle_deg))
+                heading += angle
+                continue
+            distance = move["distance"]
+            radians = math.radians(heading)
+            position = QPointF(move["target_scene"]) if "target_scene" in move else position + QPointF(math.cos(radians) * distance * self.pixels_per_mm, math.sin(radians) * distance * self.pixels_per_mm)
+            next_wp = add_waypoint(position)
+            segment = PathSegment(current, next_wp, self.pixels_per_mm)
+            segment.imported_estimate = move["estimated"]
+            segment.reverse = distance < 0
+            if move["type"] == "line":
+                segment.movement_type = "Line Follow (PID)"
+                segment.line_side = move["side"]
+                segment.line_stop = move["stop"]
+            segment.updateMovementAppearance()
+            self.segments.append(segment)
+            self.scene.addItem(segment)
+            current = next_wp
+        self.robot_item.setPos(self.waypoints[0].scenePos())
+        self.scene.clearSelection()
+        self.refreshRobotPreview()
+        self.geometryChanged.emit(self.waypoints[0])
+        self.viewport().update()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -602,6 +956,7 @@ class RobotCanvas(QGraphicsView):
 
             self.background = item
             self.background_image = image
+            self.track_mask = None
             self.track_debug_item = None
             self.scene.addItem(item)
             if self.track_debug_enabled:
@@ -647,6 +1002,183 @@ class RobotCanvas(QGraphicsView):
             self.track_debug_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.track_debug_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.track_debug_item.setVisible(True)
+
+    def buildIntersectionMask(self):
+        """Cache the same dark-pixel predicate used by the sensor/debug overlay at half resolution."""
+        if self.background_image is None:
+            return None
+        if self.track_mask is not None:
+            return self.track_mask
+        image = self.background_image
+        width, height = (image.width() + 1) // 2, (image.height() + 1) // 2
+        mask = bytearray(width * height)
+        for y in range(height):
+            for x in range(width):
+                color = image.pixelColor(min(x * 2, image.width() - 1), min(y * 2, image.height() - 1))
+                dark = min(color.red(), color.green(), color.blue())
+                bright = max(color.red(), color.green(), color.blue())
+                mask[y * width + x] = int(bright < 110 and bright - dark < 45)
+        self.track_mask = (width, height, mask)
+        return self.track_mask
+
+    def findIntersectionNear(self, scene_position, radius_mm=110.0):
+        """Find a nearby T/+ junction by requiring three connected, narrow black arms.
+
+        This is a geometric PDF locator, NOT a replacement for the runtime sensor detector.
+        It intentionally rejects bends (only two arms) and broad solid dark patches.
+        """
+        data = self.buildIntersectionMask()
+        if data is None or self.background is None:
+            return None
+        width, height, mask = data
+        local = self.background.mapFromScene(scene_position)
+        cx, cy = round(local.x() / 2), round(local.y() / 2)
+        radius = max(5, round(radius_mm * self.pixels_per_mm / 2))
+        radius = min(radius, 90)
+        def black(x, y):
+            return 0 <= x < width and 0 <= y < height and mask[y * width + x] == 1
+        hits = []
+        for y in range(max(22, cy - radius), min(height - 22, cy + radius + 1), 2):
+            for x in range(max(22, cx - radius), min(width - 22, cx + radius + 1), 2):
+                if (x - cx) ** 2 + (y - cy) ** 2 > radius * radius or not black(x, y):
+                    continue
+                arms = []
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    support = sum(any(black(x + dx * step + dy * shift, y + dy * step + dx * shift) for shift in (-2, 0, 2)) for step in (8, 13, 19))
+                    arms.append(support >= 3)
+                if sum(arms) < 3:
+                    continue
+                # A track is a thin strip: reject large dark filled rectangles.
+                if sum(black(x + dx, y + dy) for dx, dy in ((12, 12), (-12, 12), (12, -12), (-12, -12))) >= 2:
+                    continue
+                hits.append((x, y, sum(arms)))
+        if not hits:
+            return None
+        # Group neighboring qualifying pixels into a single junction candidate, then
+        # choose the junction nearest the current waypoint rather than a distant crossing.
+        clusters = []
+        for x, y, score in hits:
+            matches = [cluster for cluster in clusters if (x - cluster[0] / cluster[2]) ** 2 + (y - cluster[1] / cluster[2]) ** 2 < 14 ** 2]
+            if matches:
+                cluster = matches[0]
+                cluster[0] += x
+                cluster[1] += y
+                cluster[2] += 1
+                cluster[3] = max(cluster[3], score)
+            else:
+                clusters.append([float(x), float(y), 1, score])
+        clusters.sort(key=lambda cluster: ((cluster[0] / cluster[2] - cx) ** 2 + (cluster[1] / cluster[2] - cy) ** 2, -cluster[2]))
+        x, y, _, _ = clusters[0]
+        count = clusters[0][2]
+        return self.background.mapToScene(QPointF(2.0 * x / count, 2.0 * y / count))
+
+    def edgeAlignedWaypointPosition(self, junction_centre, incoming):
+        """Align the turn pivot to the selected edge at the junction's forward station.
+
+        The waypoint is the robot's rotation centre, not its forward-mounted sensor.
+        The light sensor triggers earlier, and the robot must keep driving to the pivot.
+        """
+        start = incoming.start_waypoint.scenePos()
+        dx = junction_centre.x() - start.x()
+        dy = junction_centre.y() - start.y()
+        length = math.hypot(dx, dy)
+        if length <= 1 or self.background is None or self.track_mask is None:
+            return None
+        forward_x, forward_y = dx / length, dy / length
+        right_x, right_y = -forward_y, forward_x
+        # Sample the incoming arm *before* the intersection so the cross-arm
+        # does not make the stripe appear artificially wide.
+        sample_back = min(length * 0.45, 65.0 * self.pixels_per_mm)
+        approach = junction_centre - QPointF(forward_x * sample_back, forward_y * sample_back)
+        width, height, mask = self.track_mask
+        def black_at(point):
+            local = self.background.mapFromScene(point)
+            x, y = round(local.x() / 2), round(local.y() / 2)
+            return 0 <= x < width and 0 <= y < height and bool(mask[y * width + x])
+        # Find nearby black stripe centre, accounting for the route being
+        # slightly off the black-track centreline.
+        centre_shift = None
+        for offset_mm in range(0, 46, 2):
+            for sign in ((1, -1) if offset_mm else (1,)):
+                offset = sign * offset_mm * self.pixels_per_mm
+                probe = approach + QPointF(right_x * offset, right_y * offset)
+                if black_at(probe):
+                    centre_shift = offset
+                    break
+            if centre_shift is not None:
+                break
+        if centre_shift is None:
+            return None
+        # Walk to both edges; this estimates the midline rather than treating
+        # the first black pixel as the line centre.
+        def edge_distance(direction):
+            last_black = 0.0
+            for mm in range(1, 46):
+                offset = centre_shift + direction * mm * self.pixels_per_mm
+                if not black_at(approach + QPointF(right_x * offset, right_y * offset)):
+                    return centre_shift + direction * (mm - 0.5) * self.pixels_per_mm
+                last_black = offset
+            return None
+        left_edge = edge_distance(-1)
+        right_edge = edge_distance(1)
+        if left_edge is None or right_edge is None:
+            return None
+        # Reject very wide dark objects that are unlikely to be the thin route.
+        stripe_width_mm = (right_edge - left_edge) / self.pixels_per_mm
+        if not (5.0 <= stripe_width_mm <= 65.0):
+            return None
+        chosen = right_edge if incoming.line_side == "right" else left_edge
+        # The selected line edge defines the desired LATERAL lane.
+        # The robot centre must still reach the true junction for an in-place turn.
+        edge_point = junction_centre + QPointF(right_x * chosen, right_y * chosen)
+        sensor_y = self.robot.sensor_y_mm * self.pixels_per_mm
+        # Only remove lateral sensor offset. The robot's rotation centre must
+        # remain at the junction's longitudinal station, AFTER the sensor
+        # first detects the black intersection ahead of the axle.
+        lateral_sensor = QPointF(right_x * sensor_y, right_y * sensor_y)
+        return edge_point - lateral_sensor
+
+    def snapWaypointToIntersection(self, waypoint, quiet=False):
+        if waypoint not in self.waypoints or self.background_image is None:
+            if not quiet:
+                self.sensorReading.emit("Import the game mat PDF before auto-aligning a waypoint")
+            return False
+        incoming = next((segment for segment in waypoint.connected_segments if segment.end_waypoint is waypoint and segment.movement_type == "Line Follow (PID)" and segment.line_stop == "Intersection"), None)
+        if incoming is None:
+            if not quiet:
+                self.sensorReading.emit("Choose Line Follow (PID) and Intersection stop on the incoming segment first")
+            return False
+        centre = self.findIntersectionNear(waypoint.scenePos())
+        if centre is None:
+            if not quiet:
+                self.sensorReading.emit(f"No confident T/cross junction near Waypoint {waypoint.waypoint_id}; position unchanged")
+            return False
+        position = self.edgeAlignedWaypointPosition(centre, incoming)
+        if position is None:
+            if not quiet:
+                self.sensorReading.emit("Could not identify the selected track edge on the intersection approach; waypoint unchanged")
+            return False
+        waypoint.setPos(position)
+        if not quiet:
+            self.sensorReading.emit(f"Waypoint {waypoint.waypoint_id}: robot centre aligned for {incoming.line_side} edge and sensor offset")
+        return True
+
+    def snapAllIntersectionWaypoints(self):
+        success = sum(self.snapWaypointToIntersection(wp, quiet=True) for wp in self.waypoints[1:])
+        self.sensorReading.emit(f"Auto-aligned {success} intersection waypoint(s); others unchanged")
+
+    def effectiveWaypointTurn(self, waypoint, route_heading, heading):
+        """Resolve an editable relative turn and clip its magnitude at the waypoint."""
+        route_delta = (route_heading - heading + 180) % 360 - 180
+        incoming = next((candidate for candidate in waypoint.connected_segments if candidate.end_waypoint is waypoint and candidate.movement_type == "Line Follow (PID)" and candidate.line_stop == "Intersection"), None)
+        if waypoint.turn_override_enabled:
+            delta = waypoint.turn_angle_deg
+        elif incoming is not None and waypoint.intersection_direction != "Follow Route":
+            delta = {"Left": -90.0, "Right": 90.0, "Straight": 0.0}[waypoint.intersection_direction]
+        else:
+            delta = route_delta
+        clipped_delta = max(-waypoint.turn_clip_deg, min(waypoint.turn_clip_deg, delta))
+        return (heading + clipped_delta + 180) % 360 - 180
 
     def deleteWaypoint(self, item):
         index = self.waypoints.index(item)
@@ -716,12 +1248,16 @@ class RobotCanvas(QGraphicsView):
             waypoint = self.waypoints[self.preview_index]
             incoming = next((segment for segment in waypoint.connected_segments if segment.end_waypoint is waypoint), None)
             outgoing = next((segment for segment in waypoint.connected_segments if segment.start_waypoint is waypoint), None)
-            if self.preview_index == 0:
-                heading = self.robot.initial_heading
-            elif self.preview_mode == "Arrival":
-                heading = incoming.angle_degrees if incoming is not None else self.robot.initial_heading
+            incoming_heading = self.robot.initial_heading if self.preview_index == 0 else (incoming.angle_degrees if incoming is not None else self.robot.initial_heading)
+            if incoming_heading is None:
+                incoming_heading = self.robot.initial_heading
+            if self.preview_mode == "Arrival":
+                heading = incoming_heading
+            elif outgoing is None:
+                heading = self.effectiveWaypointTurn(waypoint, incoming_heading, incoming_heading) if waypoint.turn_override_enabled else incoming_heading
             else:
-                heading = outgoing.angle_degrees if outgoing is not None else (incoming.angle_degrees if incoming is not None else self.robot.initial_heading)
+                route_heading = outgoing.angle_degrees if outgoing.angle_degrees is not None else incoming_heading
+                heading = self.effectiveWaypointTurn(waypoint, route_heading, incoming_heading)
             if heading is None:
                 self.preview_item.setVisible(False)
                 return
@@ -766,6 +1302,52 @@ class RobotCanvas(QGraphicsView):
             return "Light sensor: Import the field PDF and position the sensor on the mat"
         return f"Simulated reflection: {reading:.1f}% (black 3%, white 94%; PDF edge model)"
 
+    def clearSimulationTrail(self):
+        self.trail_path = QPainterPath()
+        self.trail_item.setPath(self.trail_path)
+        if self.waypoints:
+            start = self.preview_item.pos()
+            self.trail_path.moveTo(start)
+            self.trail_item.setPath(self.trail_path)
+        self.publishDebug()
+
+    def setTrailVisible(self, visible):
+        self.trail_enabled = bool(visible)
+        self.trail_item.setVisible(self.trail_enabled)
+
+    def recordSimulationTrail(self):
+        if not self.waypoints or self.trail_path.elementCount() == 0:
+            return
+        position = self.preview_item.pos()
+        last = self.trail_path.currentPosition()
+        if math.hypot(position.x() - last.x(), position.y() - last.y()) >= 0.4:
+            self.trail_path.lineTo(position)
+            self.trail_item.setPath(self.trail_path)
+
+    def publishDebug(self):
+        segment = next((s for s in self.segments if self.preview_segment_index < len(self.waypoints) - 1 and s.start_waypoint is self.waypoints[self.preview_segment_index] and s.end_waypoint is self.waypoints[self.preview_segment_index + 1]), None)
+        reading = self.sampleTrackReflectance(self.preview_sensor.scenePos()) if self.background_image is not None and self.preview_enabled else None
+        self.debugUpdated.emit({"reflection": reading, "target": segment.line_target if segment is not None and segment.movement_type == "Line Follow (PID)" else None, "error": self.debug_error if self.preview_phase == "drive" else None, "left_dps": self.debug_left_dps if self.preview_phase == "drive" else None, "right_dps": self.debug_right_dps if self.preview_phase == "drive" else None, "intersections": self.line_intersections_found, "intersection_target": segment.end_waypoint.intersection_count if segment is not None and segment.line_stop == "Intersection" and segment.movement_type == "Line Follow (PID)" else None, "heading": self.preview_heading, "phase": self.preview_phase, "status": self.debug_status, "elapsed": self.debug_elapsed, "segment": self.preview_segment_index, "multiplier": self.preview_speed_multiplier})
+
+    def singleStepPreview(self):
+        if len(self.waypoints) < 2:
+            return
+        if not self.preview_enabled:
+            self.preview_enabled = True
+        if not self.preview_paused and not self.preview_playing:
+            self.playRobotPreview()
+            if not self.preview_playing:
+                return
+            self.preview_timer.stop()
+        elif not self.preview_playing:
+            self.preview_playing = True
+        self.preview_timer.stop()
+        self.advanceRobotPreview(0.02 / max(0.01, self.preview_speed_multiplier))
+        if self.preview_playing:
+            self.preview_playing = False
+            self.preview_paused = True
+        self.publishDebug()
+
     def beginPreviewDrive(self):
         self.preview_drive_start = QPointF(self.preview_item.pos())
         self.line_last_error = 0.0
@@ -780,6 +1362,10 @@ class RobotCanvas(QGraphicsView):
         self.line_align_distance_mm = 0.0
         self.line_approach_phase = False
         self.line_crossing_phase = False
+        self.debug_error = None
+        self.debug_left_dps = None
+        self.debug_right_dps = None
+        self.debug_status = "Driving"
 
     def advanceLineTrack(self, segment, elapsed):
         distance_mm = segment.distance * 10
@@ -795,10 +1381,11 @@ class RobotCanvas(QGraphicsView):
             self.updatePreviewSensor()
             reading = self.sampleTrackReflectance(self.preview_sensor.scenePos())
             if reading is None:
+                self.debug_status = "Stopped: sensor outside mat"
                 self.pauseRobotPreview()
                 self.sensorReading.emit("Line tracking stopped: sensor outside imported PDF or no field loaded")
                 return
-            base_dps = segment.speed_mm_s * 360 / (math.pi * max(1.0, self.robot.wheel_diameter))
+            base_dps = (-1 if segment.reverse else 1) * segment.speed_mm_s * 360 / (math.pi * max(1.0, self.robot.wheel_diameter))
             wheel_factor = math.pi * self.robot.wheel_diameter / 360.0
             if self.line_crossing_phase and reading >= 35 and self.line_travel_mm - self.line_last_intersection_mm >= 15:
                 self.line_crossing_phase = False
@@ -834,6 +1421,10 @@ class RobotCanvas(QGraphicsView):
                     else:
                         self.line_crossing_phase = True
                         self.line_alignment_heading = self.preview_heading
+            self.debug_error = segment.line_target - reading
+            self.debug_left_dps = left_dps
+            self.debug_right_dps = right_dps
+            self.debug_status = "Aligning at junction" if self.line_approach_phase else ("Crossing junction" if self.line_crossing_phase else "Tracking " + segment.line_side + " edge")
             left_speed, right_speed = left_dps * wheel_factor, right_dps * wheel_factor
             angular_speed = (left_speed - right_speed) / max(1.0, self.robot.axle_track)
             mid_heading = math.radians(self.preview_heading) + angular_speed * dt / 2
@@ -856,6 +1447,7 @@ class RobotCanvas(QGraphicsView):
                     self.finishPreviewSegment()
                     return
                 if forward_remaining < -10 or self.line_align_distance_mm > max(150, distance_mm * 0.6):
+                    self.debug_status = "Stopped: intersection alignment failed"
                     self.pauseRobotPreview()
                     self.sensorReading.emit(f"Intersection alignment failed: waypoint {waypoint.waypoint_id} is not on the robot's forward trajectory (lateral error {lateral_error:.0f} mm)")
                     return
@@ -863,6 +1455,7 @@ class RobotCanvas(QGraphicsView):
                 self.finishPreviewSegment()
                 return
             if self.line_travel_mm >= max(distance_mm * 1.8 + 100, distance_mm + 150):
+                self.debug_status = "Stopped: intersection not found"
                 self.pauseRobotPreview()
                 self.sensorReading.emit(f"Line tracking stopped: detected {self.line_intersections_found}/{waypoint.intersection_count} intersections before distance safety limit")
                 return
@@ -878,6 +1471,11 @@ class RobotCanvas(QGraphicsView):
         if self.preview_playing:
             return
         if not self.preview_paused:
+            self.debug_elapsed = 0.0
+            self.debug_status = "Starting"
+            self.debug_error = None
+            self.debug_left_dps = None
+            self.debug_right_dps = None
             self.preview_segment_index = 0
             waypoint = self.waypoints[0]
             self.preview_index = 0
@@ -895,12 +1493,18 @@ class RobotCanvas(QGraphicsView):
         self.preview_paused = False
         self.preview_clock.start()
         self.preview_timer.start()
+        if self.debug_elapsed == 0.0:
+            self.clearSimulationTrail()
+        self.publishDebug()
 
     def pauseRobotPreview(self):
         self.preview_paused = self.preview_playing and self.preview_segment_index < len(self.waypoints) - 1
         self.preview_playing = False
         self.preview_timer.stop()
+        if self.debug_status not in ("Finished", "Stopped: sensor outside mat", "Stopped: intersection alignment failed", "Stopped: intersection not found"):
+            self.debug_status = "Paused" if self.preview_paused else "Stopped"
         self.previewStopped.emit()
+        self.publishDebug()
 
     def resetRobotPreview(self):
         self.pauseRobotPreview()
@@ -909,12 +1513,43 @@ class RobotCanvas(QGraphicsView):
         self.preview_mode = "Departure"
         self.refreshRobotPreview()
         self.previewProgress.emit(0)
+        self.debug_elapsed = 0.0
+        self.debug_error = None
+        self.debug_left_dps = None
+        self.debug_right_dps = None
+        self.debug_status = "Ready"
+        self.clearSimulationTrail()
 
-    def advanceRobotPreview(self):
-        if not self.preview_playing or self.preview_segment_index >= len(self.waypoints) - 1:
+    def advanceRobotPreview(self, step_seconds=None):
+        if not self.preview_playing:
+            return
+        frame_seconds = min(self.preview_clock.restart() / 1000.0, 0.1) if step_seconds is None else step_seconds
+        simulation_seconds = frame_seconds * self.preview_speed_multiplier
+        self.debug_elapsed += simulation_seconds
+        self._advanceRobotPreviewCore(simulation_seconds)
+        self.recordSimulationTrail()
+        self.publishDebug()
+
+    def _advanceRobotPreviewCore(self, simulation_seconds):
+        if not self.preview_playing:
+            return
+        if self.preview_phase == "final_turn":
+            elapsed = simulation_seconds
+            duration = abs(self.preview_final_delta) / max(1.0, self.preview_turn_speed_deg_s)
+            self.preview_phase_progress = min(1.0, self.preview_phase_progress + elapsed / max(0.001, duration))
+            self.preview_heading = self.preview_turn_start + self.preview_final_delta * self.preview_phase_progress
+            self.preview_item.setRotation(self.preview_heading)
+            self.updatePreviewSensor()
+            if self.preview_phase_progress >= 1.0:
+                self.preview_phase = "finished"
+                self.pauseRobotPreview()
+                self.preview_paused = False
+                self.previewFinished.emit()
+            return
+        if self.preview_segment_index >= len(self.waypoints) - 1:
             self.pauseRobotPreview()
             return
-        remaining = min(self.preview_clock.restart() / 1000.0, 0.1)
+        remaining = simulation_seconds
         for _ in range(12):
             if remaining <= 0 or not self.preview_playing:
                 break
@@ -926,17 +1561,19 @@ class RobotCanvas(QGraphicsView):
             if distance == 0:
                 self.finishPreviewSegment()
                 continue
-            target_heading = math.degrees(math.atan2(dy, dx))
             segment = next((segment for segment in self.segments if segment.start_waypoint is self.waypoints[self.preview_segment_index] and segment.end_waypoint is self.waypoints[self.preview_segment_index + 1]), None)
+            target_heading = math.degrees(math.atan2(dy, dx))
+            if segment is not None and segment.reverse:
+                target_heading = (target_heading + 180.0) % 360.0
             if self.preview_phase == "turn":
+                self.debug_status = "Turning"
+                self.debug_error = None
+                self.debug_left_dps = None
+                self.debug_right_dps = None
                 if self.preview_phase_progress == 0:
                     self.preview_turn_start = self.preview_heading
-                    self.preview_turn_target = target_heading
                     origin = self.waypoints[self.preview_segment_index]
-                    incoming = next((candidate for candidate in origin.connected_segments if candidate.end_waypoint is origin and candidate.movement_type == "Line Follow (PID)" and candidate.line_stop == "Intersection"), None)
-                    if incoming is not None and origin.intersection_direction != "Follow Route":
-                        branch_angle = {"Left": -90, "Right": 90, "Straight": 0}[origin.intersection_direction]
-                        self.preview_turn_target = (self.preview_heading + branch_angle + 180) % 360 - 180
+                    self.preview_turn_target = self.effectiveWaypointTurn(origin, target_heading, self.preview_heading)
                 delta = (self.preview_turn_target - self.preview_turn_start + 180) % 360 - 180
                 duration = abs(delta) / (segment.turn_speed_deg_s if segment is not None else self.preview_turn_speed_deg_s)
                 if duration <= 0:
@@ -961,12 +1598,20 @@ class RobotCanvas(QGraphicsView):
                     self.advanceLineTrack(segment, remaining)
                     remaining = 0
                     continue
-                duration = distance / ((segment.speed_mm_s if segment is not None else self.preview_speed_mm_s) * self.pixels_per_mm)
+                reverse = segment is not None and segment.reverse
+                self.debug_status = "Reversing" if reverse else "Driving straight"
+                self.debug_error = None
+                speed_mm_s = segment.speed_mm_s if segment is not None else self.preview_speed_mm_s
+                wheel_dps = (-1 if reverse else 1) * speed_mm_s * 360 / (math.pi * max(1.0, self.robot.wheel_diameter))
+                self.debug_left_dps = wheel_dps
+                self.debug_right_dps = wheel_dps
+                duration = distance / (speed_mm_s * self.pixels_per_mm)
                 available = (1.0 - self.preview_phase_progress) * duration
                 taken = min(remaining, available)
                 self.preview_phase_progress = min(1.0, self.preview_phase_progress + taken / duration)
                 direction = math.radians(self.preview_heading)
-                self.preview_item.setPos(self.preview_drive_start + QPointF(math.cos(direction) * distance * self.preview_phase_progress, math.sin(direction) * distance * self.preview_phase_progress))
+                signed_distance = -distance if reverse else distance
+                self.preview_item.setPos(self.preview_drive_start + QPointF(math.cos(direction) * signed_distance * self.preview_phase_progress, math.sin(direction) * signed_distance * self.preview_phase_progress))
                 remaining -= taken
                 if self.preview_phase_progress >= 1.0:
                     self.finishPreviewSegment()
@@ -979,6 +1624,14 @@ class RobotCanvas(QGraphicsView):
         self.preview_phase = "turn"
         self.preview_phase_progress = 0.0
         if self.preview_segment_index >= len(self.waypoints) - 1:
+            final = self.waypoints[-1]
+            if final.turn_override_enabled and final.turn_clip_deg > 0 and abs(final.turn_angle_deg) > 0.001:
+                self.preview_turn_start = self.preview_heading
+                self.preview_final_delta = max(-final.turn_clip_deg, min(final.turn_clip_deg, final.turn_angle_deg))
+                self.preview_phase = "final_turn"
+                self.preview_phase_progress = 0.0
+                return
+            self.debug_status = "Finished"
             self.pauseRobotPreview()
             self.preview_paused = False
             self.previewFinished.emit()
@@ -1101,6 +1754,30 @@ class MainWindow(QMainWindow):
         self.sensor_y_input.valueChanged.connect(self.updateSensorProperties)
         self.sensor_size_input.valueChanged.connect(self.updateSensorProperties)
 
+        self.turn_group = QGroupBox("Waypoint Turn")
+        turn_layout = QFormLayout()
+        self.turn_override_input = QCheckBox("Use custom angle")
+        self.turn_angle_input = QDoubleSpinBox()
+        self.turn_angle_input.setRange(-180, 180)
+        self.turn_angle_input.setDecimals(1)
+        self.turn_angle_input.setSuffix(" °")
+        self.turn_angle_input.setToolTip("Executed at this waypoint BEFORE the next segment. Negative = anticlockwise on screen, positive = clockwise.")
+        self.turn_clip_input = QDoubleSpinBox()
+        self.turn_clip_input.setRange(0, 180)
+        self.turn_clip_input.setDecimals(1)
+        self.turn_clip_input.setValue(180)
+        self.turn_clip_input.setSuffix(" °")
+        self.turn_clip_input.setToolTip("Maximum magnitude of the RELATIVE turn in preview. 180° leaves turns unrestricted")
+        turn_layout.addRow(self.turn_override_input)
+        turn_layout.addRow("Relative turn:", self.turn_angle_input)
+        turn_layout.addRow("Maximum angle limit:", self.turn_clip_input)
+        self.turn_group.setLayout(turn_layout)
+        self.turn_group.setEnabled(False)
+        properties_layout.addWidget(self.turn_group)
+        self.turn_override_input.toggled.connect(self.updateTurnProperties)
+        self.turn_angle_input.valueChanged.connect(self.updateTurnProperties)
+        self.turn_clip_input.valueChanged.connect(self.updateTurnProperties)
+
         self.intersection_group = QGroupBox("Waypoint Intersection")
         intersection_layout = QFormLayout()
         self.intersection_count_input = QSpinBox()
@@ -1112,6 +1789,10 @@ class MainWindow(QMainWindow):
         self.intersection_group.setLayout(intersection_layout)
         properties_layout.addWidget(self.intersection_group)
         self.intersection_group.setEnabled(False)
+        self.snap_intersection_button = QPushButton("Auto-align This Waypoint")
+        self.snap_intersection_button.setToolTip("Align robot centre so the light sensor is on the selected LEFT/RIGHT edge of the incoming black track at the nearby junction")
+        intersection_layout.addRow(self.snap_intersection_button)
+        self.snap_intersection_button.clicked.connect(self.autoAlignSelectedWaypoint)
         self.intersection_count_input.valueChanged.connect(self.updateIntersectionProperties)
         self.intersection_direction_input.currentTextChanged.connect(self.updateIntersectionProperties)
 
@@ -1120,6 +1801,7 @@ class MainWindow(QMainWindow):
         movement_layout = QFormLayout()
         self.movement_type_input = QComboBox()
         self.movement_type_input.addItems(["Drive Straight", "Line Follow (PID)"])
+        self.reverse_input = QCheckBox("Reverse (drive backward without turning 180°)")
         self.speed_input = QDoubleSpinBox()
         self.speed_input.setRange(1, 2000)
         self.speed_input.setSuffix(" mm/s")
@@ -1142,6 +1824,7 @@ class MainWindow(QMainWindow):
             control.setDecimals(3)
             control.setSingleStep(0.1)
         movement_layout.addRow("Movement:", self.movement_type_input)
+        movement_layout.addRow(self.reverse_input)
         movement_layout.addRow("Drive speed:", self.speed_input)
         movement_layout.addRow("Turn speed:", self.turn_speed_input)
         movement_layout.addRow("Line stop:", self.line_stop_input)
@@ -1154,6 +1837,7 @@ class MainWindow(QMainWindow):
         self.movement_group.setEnabled(False)
         properties_layout.addWidget(self.movement_group)
         self.movement_type_input.currentTextChanged.connect(self.updateMovementProperties)
+        self.reverse_input.toggled.connect(self.updateMovementProperties)
         self.line_side_input.currentTextChanged.connect(self.updateMovementProperties)
         self.line_stop_input.currentTextChanged.connect(self.updateMovementProperties)
         for control in (self.speed_input, self.turn_speed_input, self.line_target_input, self.kp_input, self.ki_input, self.kd_input):
@@ -1216,6 +1900,39 @@ class MainWindow(QMainWindow):
         self.canvas.geometryChanged.connect(self.updatePreviewControls)
         self.updatePreviewControls()
 
+        self.live_debug_group = QGroupBox("Live Simulation Debugger")
+        live_debug_layout = QFormLayout()
+        self.debug_fields = {}
+        for key, label in (("reflection", "Sensor reflection:"), ("target", "Target reflection:"), ("error", "PD/PID error:"), ("left_dps", "Left motor:"), ("right_dps", "Right motor:"), ("intersections", "Intersections:"), ("heading", "Robot heading:"), ("phase", "Movement phase:"), ("elapsed", "Simulated time:"), ("status", "Status:")):
+            output = QLabel("—")
+            output.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            output.setWordWrap(True)
+            live_debug_layout.addRow(label, output)
+            self.debug_fields[key] = output
+        self.debug_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.debug_speed_slider.setRange(10, 400)
+        self.debug_speed_slider.setSingleStep(10)
+        self.debug_speed_slider.setValue(100)
+        self.debug_speed_label = QLabel("1.00×")
+        self.debug_speed_slider.valueChanged.connect(self.setDebugPlaybackSpeed)
+        live_debug_layout.addRow("Playback speed:", self.debug_speed_slider)
+        live_debug_layout.addRow("Speed multiplier:", self.debug_speed_label)
+        self.debug_step_button = QPushButton("Step +20 ms")
+        self.debug_step_button.setToolTip("Advance exactly 20 ms of simulated motion and remain paused")
+        self.debug_step_button.clicked.connect(self.stepSimulation)
+        live_debug_layout.addRow(self.debug_step_button)
+        self.debug_trail_toggle = QCheckBox("Show actual robot trail")
+        self.debug_trail_toggle.setChecked(True)
+        self.debug_trail_toggle.toggled.connect(self.canvas.setTrailVisible)
+        live_debug_layout.addRow(self.debug_trail_toggle)
+        self.debug_clear_trail_button = QPushButton("Clear Trail")
+        self.debug_clear_trail_button.clicked.connect(self.canvas.clearSimulationTrail)
+        live_debug_layout.addRow(self.debug_clear_trail_button)
+        self.live_debug_group.setLayout(live_debug_layout)
+        properties_layout.addWidget(self.live_debug_group)
+        self.canvas.debugUpdated.connect(self.updateSimulationDebug)
+        self.canvas.publishDebug()
+
         properties_scroll = QScrollArea()
         properties_scroll.setWidgetResizable(True)
         properties_scroll.setWidget(properties_widget)
@@ -1230,10 +1947,29 @@ class MainWindow(QMainWindow):
         import_action.triggered.connect(self.canvas.importField)
         file_menu.addAction(import_action)
 
+        export_action = QAction("Export Pybricks Route...", self)
+        export_action.triggered.connect(self.exportPybricksRoute)
+        file_menu.addAction(export_action)
+        import_code_action = QAction("Import Pybricks Route...", self)
+        import_code_action.triggered.connect(self.importPybricksRoute)
+        file_menu.addAction(import_code_action)
+
         toolbar = QToolBar("Main Toolbar", self)
         self.addToolBar(toolbar)
 
         toolbar.addAction(import_action)
+        toolbar.addAction(export_action)
+        toolbar.addAction(import_code_action)
+        auto_snap_action = QAction("Auto-align Intersection Waypoints", self)
+        auto_snap_action.triggered.connect(self.canvas.snapAllIntersectionWaypoints)
+        toolbar.addAction(auto_snap_action)
+        auto_snap_toggle = QAction("Auto-snap Intersection Waypoints on Drag", self)
+        auto_snap_toggle.setCheckable(True)
+        auto_snap_toggle.setChecked(True)
+        auto_snap_toggle.toggled.connect(lambda enabled: setattr(self.canvas, "auto_snap_intersections", enabled))
+        view_menu_intersections = self.menuBar().addMenu("Intersections")
+        view_menu_intersections.addAction(auto_snap_action)
+        view_menu_intersections.addAction(auto_snap_toggle)
 
         track_debug_action = QAction("Show Detected Track", self)
         track_debug_action.setCheckable(True)
@@ -1242,6 +1978,11 @@ class MainWindow(QMainWindow):
         toolbar.addAction(track_debug_action)
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(track_debug_action)
+        grid_action = QAction("Show 100 mm Coordinate Grid", self)
+        grid_action.setCheckable(True)
+        grid_action.setChecked(True)
+        grid_action.toggled.connect(lambda visible: (setattr(self.canvas, "show_coordinate_grid", visible), self.canvas.viewport().update()))
+        view_menu.addAction(grid_action)
 
         tool_group = QActionGroup(self)
         tool_group.setExclusive(True)
@@ -1261,6 +2002,99 @@ class MainWindow(QMainWindow):
         toolbar.addAction(select_action)
         toolbar.addAction(waypoint_action)
 
+    def importPybricksRoute(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Import Pybricks Movement Calls")
+        dialog.resize(800, 620)
+        layout = QVBoxLayout(dialog)
+        info = QLabel("Paste minimal Pybricks movement calls, including negative distances for reversing. The robot's current starting position and heading are used. The route replaces existing waypoints only after you click Generate. Grid axes are in millimetres relative to Waypoint 0; +Y points down on screen.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        editor = QTextEdit(dialog)
+        editor.setPlaceholderText('gyroDriveStraight(300)\nturn(90)\nsingleLineTrackByDist(450, side="left")\nturn(-90)\nsingleLineTrackTillIntersection()')
+        layout.addWidget(editor)
+        auto_detect = QCheckBox("Auto-detect next intersection from imported PDF (straight approaches)")
+        auto_detect.setChecked(self.canvas.background_image is not None)
+        auto_detect.setEnabled(self.canvas.background_image is not None)
+        auto_detect.setToolTip("Search along the current heading for the next detected T/cross junction, then align to the selected track edge. Requires a loaded PDF and correctly positioned starting robot.")
+        layout.addWidget(auto_detect)
+        estimation_row = QHBoxLayout()
+        estimation_row.addWidget(QLabel("Fallback intersection distance:"))
+        estimate_input = QDoubleSpinBox(dialog)
+        estimate_input.setRange(10, 5000)
+        estimate_input.setDecimals(0)
+        estimate_input.setValue(200)
+        estimate_input.setSuffix(" mm")
+        estimation_row.addWidget(estimate_input)
+        layout.addLayout(estimation_row)
+        note = QLabel("With auto-detection, each 'track till intersection' command searches the loaded PDF ahead of the current position and heading, then aligns the robot centre to the chosen line edge. An unresolved junction uses the fallback distance. This is geometric placement, not physical line-following; place the starting robot and heading accurately.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QHBoxLayout()
+        generate_button = QPushButton("Generate Route on Map")
+        cancel_button = QPushButton("Cancel")
+        buttons.addWidget(generate_button)
+        buttons.addWidget(cancel_button)
+        layout.addLayout(buttons)
+        def generate():
+            try:
+                movements, warnings = parsePybricksRoute(editor.toPlainText(), estimate_input.value(), auto_intersections=auto_detect.isChecked())
+                if auto_detect.isChecked():
+                    warnings.extend(self.canvas.resolveImportedIntersections(movements))
+            except ValueError as exc:
+                QMessageBox.warning(dialog, "Cannot parse movement calls", str(exc))
+                return
+            if warnings:
+                QMessageBox.information(dialog, "Approximate route sections", "\n".join(warnings))
+            self.canvas.loadRouteMovements(movements)
+            self.updatePreviewControls()
+            dialog.accept()
+        generate_button.clicked.connect(generate)
+        cancel_button.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def exportPybricksRoute(self):
+        code, warnings, errors = generatePybricksRoute(self.canvas.waypoints, self.canvas.segments, self.canvas.robot)
+        if errors:
+            QMessageBox.warning(self, "Cannot export route", "Fix these issues first:\n\n" + "\n".join("• " + error for error in errors))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review Pybricks Route")
+        dialog.resize(920, 700)
+        layout = QVBoxLayout(dialog)
+        info = QLabel("Minimal movement calls for your existing competition-day Pybricks main.py. Paste them where the route should run; your existing helper functions and default speeds are used. Not a standalone program.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        if warnings:
+            warning_label = QLabel("Warnings (not included in exported code):\n" + "\n".join("• " + warning for warning in warnings))
+            warning_label.setWordWrap(True)
+            layout.addWidget(warning_label)
+        editor = QTextEdit(dialog)
+        editor.setPlainText(code)
+        editor.setReadOnly(False)
+        layout.addWidget(editor)
+        button_row = QHBoxLayout()
+        save_button = QPushButton("Save Route .py")
+        close_button = QPushButton("Close")
+        button_row.addWidget(save_button)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        def save_route():
+            path, _ = QFileDialog.getSaveFileName(dialog, "Save Generated Pybricks Route", "generated_pybricks_route.py", "Python Files (*.py)")
+            if not path:
+                return
+            try:
+                compile(editor.toPlainText(), path, "exec")
+                with open(path, "w", encoding="utf-8") as file:
+                    file.write(editor.toPlainText())
+            except (OSError, SyntaxError) as exc:
+                QMessageBox.critical(dialog, "Could not save route", str(exc))
+                return
+            QMessageBox.information(dialog, "Route saved", "Movement calls saved. Paste them into your competition-day robot script at the desired location, below the helper definitions. This snippet is not standalone.")
+        save_button.clicked.connect(save_route)
+        close_button.clicked.connect(dialog.accept)
+        dialog.exec()
+
     def updateProperties(self, item):
         if isinstance(item, Waypoint):
             id = item.waypoint_id
@@ -1268,7 +2102,15 @@ class MainWindow(QMainWindow):
             self.distance_label.setText("Distance: —")
             self.angle_label.setText("Heading: —")
             turn = self.canvas.calculateTurn(item)
-            self.turn_label.setText(f"Turn: {turn:.1f}°" if turn is not None else "Turn: —")
+            route_turn = turn if turn is not None else 0.0
+            requested_turn = item.turn_angle_deg if item.turn_override_enabled else ({"Left": -90.0, "Right": 90.0, "Straight": 0.0}.get(item.intersection_direction, route_turn))
+            effective_turn = max(-item.turn_clip_deg, min(item.turn_clip_deg, requested_turn))
+            self.turn_label.setText(f"Effective turn: {effective_turn:+.1f}° (route: {route_turn:+.1f}°)" if item in self.canvas.waypoints[:-1] or item.turn_override_enabled else "Turn: final waypoint (no custom angle)")
+            with QSignalBlocker(self.turn_override_input), QSignalBlocker(self.turn_angle_input), QSignalBlocker(self.turn_clip_input):
+                self.turn_override_input.setChecked(item.turn_override_enabled)
+                self.turn_angle_input.setValue(item.turn_angle_deg if item.turn_override_enabled else (turn or 0.0))
+                self.turn_clip_input.setValue(item.turn_clip_deg)
+            self.turn_angle_input.setEnabled(True)
             self.movement_label.setText(f"Position Coordinates: X: {item.scenePos().x():.1f}, Y: {item.scenePos().y():.1f}")
             with QSignalBlocker(self.x_input), QSignalBlocker(self.y_input):
                 self.x_input.setValue(item.scenePos().x())
@@ -1279,8 +2121,9 @@ class MainWindow(QMainWindow):
                 self.intersection_count_input.setValue(item.intersection_count)
                 self.intersection_direction_input.setCurrentText(item.intersection_direction)
         if isinstance(item, PathSegment):
-            with QSignalBlocker(self.movement_type_input), QSignalBlocker(self.speed_input), QSignalBlocker(self.turn_speed_input), QSignalBlocker(self.line_side_input), QSignalBlocker(self.line_stop_input), QSignalBlocker(self.line_target_input), QSignalBlocker(self.kp_input), QSignalBlocker(self.ki_input), QSignalBlocker(self.kd_input):
+            with QSignalBlocker(self.reverse_input), QSignalBlocker(self.movement_type_input), QSignalBlocker(self.speed_input), QSignalBlocker(self.turn_speed_input), QSignalBlocker(self.line_side_input), QSignalBlocker(self.line_stop_input), QSignalBlocker(self.line_target_input), QSignalBlocker(self.kp_input), QSignalBlocker(self.ki_input), QSignalBlocker(self.kd_input):
                 self.movement_type_input.setCurrentText(item.movement_type)
+                self.reverse_input.setChecked(item.reverse)
                 self.speed_input.setValue(item.speed_mm_s)
                 self.turn_speed_input.setValue(item.turn_speed_deg_s)
                 self.line_side_input.setCurrentText(item.line_side)
@@ -1322,12 +2165,41 @@ class MainWindow(QMainWindow):
         self.robot_group.setEnabled(isinstance(item, RobotPolygon))
         self.sensor_group.setEnabled(isinstance(item, RobotPolygon))
         self.movement_group.setEnabled(isinstance(item, PathSegment))
+        self.turn_group.setEnabled(isinstance(item, Waypoint))
+        self.snap_intersection_button.setEnabled(isinstance(item, Waypoint) and self.canvas.background_image is not None)
         self.intersection_group.setEnabled(isinstance(item, Waypoint) and any(segment.end_waypoint is item and segment.movement_type == "Line Follow (PID)" and segment.line_stop == "Intersection" for segment in item.connected_segments))
         line_follow = isinstance(item, PathSegment) and item.movement_type == "Line Follow (PID)"
         for control in (self.line_side_input, self.line_stop_input, self.line_target_input, self.kp_input, self.ki_input, self.kd_input):
             control.setEnabled(line_follow)
         self.robot_add_vertex_button.setEnabled(isinstance(item, RobotPolygon) and self.canvas.robot_item.edit_mode)
         self.robot_remove_vertex_button.setEnabled(isinstance(item, RobotPolygon) and self.canvas.robot_item.edit_mode and self.canvas.robot_item.selected_vertex is not None and len(self.canvas.robot_item.vertices) > 3)
+
+    def autoAlignSelectedWaypoint(self):
+        selected = self.canvas.scene.selectedItems()
+        if len(selected) == 1 and isinstance(selected[0], Waypoint):
+            self.canvas.snapWaypointToIntersection(selected[0])
+
+    def updateTurnProperties(self, value=None):
+        selected = self.canvas.scene.selectedItems()
+        if len(selected) != 1 or not isinstance(selected[0], Waypoint):
+            return
+        waypoint = selected[0]
+        waypoint.turn_override_enabled = self.turn_override_input.isChecked() or self.sender() is self.turn_angle_input
+        waypoint.turn_angle_deg = self.turn_angle_input.value()
+        waypoint.turn_clip_deg = self.turn_clip_input.value()
+        if self.sender() is self.turn_angle_input and not self.turn_override_input.isChecked():
+            with QSignalBlocker(self.turn_override_input):
+                self.turn_override_input.setChecked(True)
+            waypoint.turn_override_enabled = True
+        self.turn_angle_input.setEnabled(True)
+        route_turn = self.canvas.calculateTurn(waypoint) or 0.0
+        requested = waypoint.turn_angle_deg if waypoint.turn_override_enabled else ({"Left": -90.0, "Right": 90.0, "Straight": 0.0}.get(waypoint.intersection_direction, route_turn))
+        applied = max(-waypoint.turn_clip_deg, min(waypoint.turn_clip_deg, requested))
+        self.turn_label.setText(f"Effective next turn: {applied:+.1f}° (route: {route_turn:+.1f}°)")
+        if self.canvas.preview_playing:
+            self.canvas.pauseRobotPreview()
+            self.canvas.preview_paused = False
+        self.canvas.refreshRobotPreview()
 
     def updateIntersectionProperties(self, value=None):
         selected_items = self.canvas.scene.selectedItems()
@@ -1345,6 +2217,7 @@ class MainWindow(QMainWindow):
             return
         segment = selected_items[0]
         segment.movement_type = self.movement_type_input.currentText()
+        segment.reverse = self.reverse_input.isChecked()
         segment.speed_mm_s = self.speed_input.value()
         segment.turn_speed_deg_s = self.turn_speed_input.value()
         segment.line_side = self.line_side_input.currentText()
@@ -1354,6 +2227,8 @@ class MainWindow(QMainWindow):
         segment.ki = self.ki_input.value()
         segment.kd = self.kd_input.value()
         segment.updateMovementAppearance()
+        if segment.movement_type == "Line Follow (PID)" and segment.line_stop == "Intersection" and self.canvas.auto_snap_intersections:
+            self.canvas.snapWaypointToIntersection(segment.end_waypoint, quiet=True)
         self.movement_label.setText(f"Movement Type: {segment.movement_type}")
         self.intersection_group.setEnabled(False)
         for control in (self.line_side_input, self.line_stop_input, self.line_target_input, self.kp_input, self.ki_input, self.kd_input):
@@ -1391,6 +2266,34 @@ class MainWindow(QMainWindow):
     def removeRobotVertex(self):
         self.canvas.robot_item.removeVertex()
         self.updateProperties(self.canvas.robot_item)
+
+    def setDebugPlaybackSpeed(self, value):
+        self.canvas.preview_speed_multiplier = value / 100.0
+        self.debug_speed_label.setText(f"{self.canvas.preview_speed_multiplier:.2f}×")
+        self.canvas.publishDebug()
+
+    def stepSimulation(self):
+        if self.canvas.preview_playing:
+            self.canvas.pauseRobotPreview()
+        if not self.preview_button.isChecked():
+            self.preview_button.setChecked(True)
+        self.canvas.singleStepPreview()
+        self.preview_play_button.setEnabled(not self.canvas.preview_playing)
+        self.preview_pause_button.setEnabled(False)
+
+    def updateSimulationDebug(self, data):
+        def format_number(value, suffix=""):
+            return "—" if value is None else f"{value:.1f}{suffix}"
+        self.debug_fields["reflection"].setText(format_number(data["reflection"], "%"))
+        self.debug_fields["target"].setText(format_number(data["target"], "%"))
+        self.debug_fields["error"].setText(format_number(data["error"]))
+        self.debug_fields["left_dps"].setText(format_number(data["left_dps"], " °/s"))
+        self.debug_fields["right_dps"].setText(format_number(data["right_dps"], " °/s"))
+        self.debug_fields["intersections"].setText(f"{data['intersections']} / {data['intersection_target']}" if data["intersection_target"] is not None else str(data["intersections"]))
+        self.debug_fields["heading"].setText(format_number(data["heading"], "°"))
+        self.debug_fields["phase"].setText(str(data["phase"]))
+        self.debug_fields["elapsed"].setText(f"{data['elapsed']:.2f} s")
+        self.debug_fields["status"].setText(data["status"])
 
     def updatePreviewControls(self, item=None):
         count = len(self.canvas.waypoints)

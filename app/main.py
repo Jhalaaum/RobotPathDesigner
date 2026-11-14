@@ -2,6 +2,8 @@
 import sys
 import math
 import ast
+import copy
+import json
 from types import SimpleNamespace
 
 from PySide6.QtWidgets import (
@@ -34,12 +36,12 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QTextEdit,
-    QMessageBox
+    QMessageBox, QListWidget, QLineEdit, QGraphicsRectItem, QGraphicsSimpleTextItem, QColorDialog
 )
 
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup, QPolygonF, QImage, QPainterPath
-from PySide6.QtCore import Qt, QSize, Signal, QSignalBlocker, QPointF, QTimer, QElapsedTimer
+from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPixmap, QAction, QActionGroup, QPolygonF, QImage, QPainterPath, QDrag, QKeySequence
+from PySide6.QtCore import Qt, QSize, Signal, QSignalBlocker, QPointF, QTimer, QElapsedTimer, QMimeData
 
 def generatePybricksRoute(waypoints, segments, robot):
     """Generate minimal movement calls for pasting into the existing Pybricks main.py."""
@@ -199,6 +201,262 @@ def parsePybricksRoute(code, intersection_distance_mm=200.0, auto_intersections=
         raise ValueError("At least one drive or line-track command is needed to draw a route.")
     return movements, warnings
 
+PART_TYPES = {
+    'Wheel': (26, 56, '#64748b'), 'Drive motor': (48, 32, '#64748b'),
+    'Colour sensor': (24, 24, '#eab308'), 'Distance sensor': (32, 24, '#0ea5e9'),
+    'Force sensor': (24, 24, '#f97316'), 'Hub / gyro': (72, 64, '#94a3b8'),
+    'Attachment motor': (48, 32, '#8b5cf6'), 'Gripper': (65, 60, '#a855f7'),
+    'Forklift': (80, 60, '#a855f7'), 'Pusher': (24, 100, '#a855f7'),
+    'Rotating arm': (90, 24, '#a855f7'), 'Linear slider': (85, 30, '#a855f7'),
+    'Cargo bay': (65, 65, '#14b8a6'), 'Custom block': (50, 50, '#6b7280'),
+}
+
+def newRobotPart(kind, x=0, y=0):
+    length, width, _ = PART_TYPES[kind]
+    return dict(kind=kind, name=kind, x=float(x), y=float(y), length=float(length), width=float(width), angle=0.0, port='', direction='Clockwise', gear_ratio=1.0, sensing=18.0, primary=False)
+
+class BuilderPalette(QListWidget):
+    def startDrag(self, actions):
+        item = self.currentItem()
+        if item is None:
+            return
+        mime = QMimeData()
+        mime.setText(item.text())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+class BuilderView(QGraphicsView):
+    def __init__(self, editor, scene):
+        super().__init__(scene)
+        self.editor = editor
+        self.setAcceptDrops(True)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setMinimumSize(420, 420)
+        self.setBackgroundBrush(QColor('#f1f5f9'))
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().text() in PART_TYPES:
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().text() in PART_TYPES:
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        kind = event.mimeData().text()
+        if kind in PART_TYPES:
+            p = self.mapToScene(event.position().toPoint())
+            self.editor.addPart(kind, p.x(), p.y())
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+    def drawBackground(self, painter, rect):
+        super().drawBackground(painter, rect)
+        painter.setPen(QPen(QColor('#dbe3ed'), 0))
+        for x in range(math.floor(rect.left()/25)*25, math.ceil(rect.right()), 25):
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+        for y in range(math.floor(rect.top()/25)*25, math.ceil(rect.bottom()), 25):
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        painter.setPen(QPen(QColor('#94a3b8'), 0, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(rect.left(), 0), QPointF(rect.right(), 0))
+        painter.drawLine(QPointF(0, rect.top()), QPointF(0, rect.bottom()))
+
+class BuilderPartItem(QGraphicsRectItem):
+    def __init__(self, editor, part):
+        super().__init__()
+        self.editor, self.part = editor, part
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setZValue(5)
+        self.label = QGraphicsSimpleTextItem(self)
+        self.label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.label.setBrush(QColor('#172033'))
+        self.syncing = False
+        self.refresh()
+
+    def refresh(self):
+        self.syncing = True
+        p = self.part
+        self.setRect(-p['length']/2, -p['width']/2, p['length'], p['width'])
+        c = QColor(PART_TYPES[p['kind']][2]); c.setAlpha(175)
+        self.setBrush(c)
+        self.setPen(QPen(QColor('#334155'), 1))
+        self.label.setText(p['name'] + (' ★' if p['primary'] else ''))
+        self.label.setPos(-p['length']/2, -p['width']/2-17)
+        self.setPos(p['x'], p['y']); self.setRotation(p['angle'])
+        self.syncing = False
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and hasattr(self, 'syncing') and not self.syncing:
+            self.part['x'], self.part['y'] = value.x(), value.y()
+            if self.isSelected():
+                self.editor.readSelection()
+        return super().itemChange(change, value)
+
+class RobotBuilder(QDialog):
+    def __init__(self, canvas, parent=None):
+        super().__init__(parent)
+        self.canvas = canvas
+        self.setWindowTitle('Robot Builder')
+        self.resize(1050, 650)
+        r = canvas.robot
+        self.parts = copy.deepcopy(getattr(r, 'parts', []))
+        if not self.parts:
+            p = newRobotPart('Colour sensor', r.sensor_x_mm, r.sensor_y_mm); p.update(primary=True, sensing=r.sensor_diameter_mm)
+            self.parts = [p]
+        else:
+            for p in self.parts:
+                if p['primary']:
+                    p.update(x=r.sensor_x_mm, y=r.sensor_y_mm, sensing=r.sensor_diameter_mm)
+        self.vertices = [[p.x()/canvas.pixels_per_mm, p.y()/canvas.pixels_per_mm] for p in canvas.robot_item.vertices]
+        self.items = []
+        self.loading = False
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel('Drag parts onto your robot  •  Forward is +X (right)  •  Dimensions in mm'))
+        body = QHBoxLayout(); root.addLayout(body, 1)
+        left = QVBoxLayout(); body.addLayout(left)
+        left.addWidget(QLabel('PARTS'))
+        self.palette = BuilderPalette(); self.palette.addItems(list(PART_TYPES)); self.palette.setDragEnabled(True); self.palette.setMaximumWidth(175)
+        left.addWidget(self.palette)
+        self.palette.itemDoubleClicked.connect(lambda item: self.addPart(item.text(), 0, 0))
+        add = QPushButton('Add selected part'); left.addWidget(add); add.clicked.connect(lambda: self.addPart(self.palette.currentItem().text(), 0, 0) if self.palette.currentItem() else None)
+        self.scene = QGraphicsScene(self); self.scene.setSceneRect(-400,-350,800,700)
+        self.view = BuilderView(self, self.scene); body.addWidget(self.view, 1)
+        self.chassis = QGraphicsPolygonItem(); self.chassis.setBrush(QColor(34,197,94,50)); self.chassis.setPen(QPen(QColor('#15803d'),2)); self.scene.addItem(self.chassis)
+        self.chassis.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.arrow = self.scene.addLine(0,0,65,0,QPen(QColor('#15803d'),3)); self.arrow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        right = QVBoxLayout(); body.addLayout(right)
+        hardware = QGroupBox('Chassis & drive'); right.addWidget(hardware); form = QFormLayout(hardware)
+        self.drive = {}
+        for key, label, value in [('length','Length',r.length),('width','Width',r.width),('wheel_diameter','Wheel diameter',r.wheel_diameter),('axle_track','Axle track',r.axle_track)]:
+            c = QDoubleSpinBox(); c.setRange(1,1000); c.setDecimals(1); c.setSuffix(' mm'); c.setValue(value); form.addRow(label,c); self.drive[key]=c
+        self.base_length = r.length; self.base_width = r.width
+        self.drive['length'].valueChanged.connect(self.updateChassis); self.drive['width'].valueChanged.connect(self.updateChassis)
+        self.updateChassis()
+        self.group = QGroupBox('Selected part'); right.addWidget(self.group); f = QFormLayout(self.group)
+        self.name = QLineEdit(); f.addRow('Name',self.name); self.name.textChanged.connect(self.writeSelection)
+        self.controls = {}
+        for key, label, low, high in [('x','Forward X',-1500,1500),('y','Right Y',-1500,1500),('length','Length',1,1000),('width','Width',1,1000),('angle','Rotation',-360,360),('gear_ratio','Gear ratio',0.01,100),('sensing','Optical diameter',1,250)]:
+            c = QDoubleSpinBox(); c.setRange(low,high); c.setDecimals(2); c.setSuffix('°' if key=='angle' else ('' if key=='gear_ratio' else ' mm')); f.addRow(label,c); self.controls[key]=c; c.valueChanged.connect(self.writeSelection)
+        self.port = QComboBox(); self.port.addItems(['','A','B','C','D','E','F']); f.addRow('Port',self.port); self.port.currentTextChanged.connect(self.writeSelection)
+        self.direction = QComboBox(); self.direction.addItems(['Clockwise','Counterclockwise']); f.addRow('Direction',self.direction); self.direction.currentTextChanged.connect(self.writeSelection)
+        self.primary = QPushButton('Use for line tracking'); f.addRow(self.primary); self.primary.clicked.connect(self.setPrimary)
+        remove = QPushButton('Remove part'); f.addRow(remove); remove.clicked.connect(self.removePart)
+        right.addStretch()
+        bottom = QHBoxLayout(); root.addLayout(bottom)
+        for label, handler in [('Load profile…',self.loadProfile),('Save profile…',self.saveProfile),('Cancel',self.reject),('Apply to robot',self.apply)]:
+            b=QPushButton(label); bottom.addWidget(b); b.clicked.connect(handler)
+        self.scene.selectionChanged.connect(self.readSelection)
+        for p in self.parts: self.addItem(p)
+        self.readSelection()
+        QTimer.singleShot(0, lambda: self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio))
+
+    def updateChassis(self):
+        sx=self.drive['length'].value()/self.base_length; sy=self.drive['width'].value()/self.base_width
+        self.chassis.setPolygon(QPolygonF([QPointF(x*sx,y*sy) for x,y in self.vertices]))
+
+    def addItem(self,p):
+        item=BuilderPartItem(self,p); self.scene.addItem(item); self.items.append(item); return item
+
+    def addPart(self,kind,x,y):
+        p=newRobotPart(kind,x,y); self.parts.append(p); item=self.addItem(p); self.scene.clearSelection(); item.setSelected(True)
+
+    def selected(self):
+        return next((i for i in self.scene.selectedItems() if isinstance(i,BuilderPartItem)),None)
+
+    def readSelection(self):
+        item=self.selected(); self.group.setEnabled(item is not None)
+        if item is None: return
+        self.loading=True
+        try:
+            p=item.part; self.name.setText(p['name']); self.port.setCurrentText(p['port']); self.direction.setCurrentText(p['direction'])
+            for k,c in self.controls.items(): c.setValue(p[k])
+            self.primary.setEnabled(p['kind']=='Colour sensor'); self.primary.setText('Active line sensor ★' if p['primary'] else 'Use for line tracking')
+            self.controls['sensing'].setEnabled(p['kind']=='Colour sensor')
+        finally: self.loading=False
+
+    def writeSelection(self,*args):
+        item=self.selected()
+        if self.loading or item is None: return
+        p=item.part; p.update(name=self.name.text(),port=self.port.currentText(),direction=self.direction.currentText())
+        p.update({k:c.value() for k,c in self.controls.items()}); item.refresh()
+
+    def setPrimary(self):
+        item=self.selected()
+        if item is None or item.part['kind']!='Colour sensor': return
+        for i in self.items: i.part['primary']=i is item; i.refresh()
+        self.readSelection()
+
+    def removePart(self):
+        item=self.selected()
+        if item is None:return
+        self.items.remove(item); self.parts.remove(item.part); self.scene.removeItem(item)
+        self.readSelection()
+
+    def profile(self):
+        return dict(version=1, drive={k:c.value() for k,c in self.drive.items()}, vertices=[[p.x(),p.y()] for p in self.chassis.polygon()], parts=copy.deepcopy(self.parts))
+
+    def validate(self, data):
+        if data['version']!=1: raise ValueError('Unsupported profile version')
+        ports=[]; primary=0
+        for k in self.drive:
+            v=data['drive'][k]
+            if not isinstance(v,(int,float)) or not math.isfinite(v) or not 1<=v<=1000: raise ValueError('Invalid drive dimension')
+        if len(data['vertices'])<3 or any(len(p)!=2 or any(not isinstance(v,(int,float)) or not math.isfinite(v) for v in p) for p in data['vertices']): raise ValueError('Invalid chassis polygon')
+        for p in data['parts']:
+            if p['kind'] not in PART_TYPES or not isinstance(p['name'],str) or p['port'] not in ('','A','B','C','D','E','F') or p['direction'] not in ('Clockwise','Counterclockwise'): raise ValueError('Invalid part')
+            for k,c in self.controls.items():
+                v=p[k]
+                if not isinstance(v,(int,float)) or not math.isfinite(v) or not c.minimum()<=v<=c.maximum(): raise ValueError('Invalid part dimension: '+k)
+            if p['port']: ports.append(p['port'])
+            if p['primary']:
+                if p['kind']!='Colour sensor': raise ValueError('Line sensor must be a colour sensor')
+                primary+=1
+        if len(ports)!=len(set(ports)): raise ValueError('Each hardware port may only be assigned once')
+        if primary!=1: raise ValueError('Select exactly one colour sensor for line tracking')
+
+    def saveProfile(self):
+        try:
+            data=self.profile(); self.validate(data)
+            path,_=QFileDialog.getSaveFileName(self,'Save robot profile','','Robot profile (*.json)')
+            if path:
+                with open(path,'w') as f: json.dump(data,f,indent=2)
+        except Exception as e: QMessageBox.warning(self,'Robot profile',str(e))
+
+    def loadProfile(self):
+        path,_=QFileDialog.getOpenFileName(self,'Load robot profile','','Robot profile (*.json)')
+        if not path:return
+        try:
+            with open(path) as f: data=json.load(f)
+            self.validate(data)
+        except Exception as e: QMessageBox.warning(self,'Robot profile',str(e)); return
+        self.scene.clearSelection()
+        for item in self.items:self.scene.removeItem(item)
+        self.items=[]; self.parts=data['parts']; self.vertices=data['vertices']; self.base_length=data['drive']['length']; self.base_width=data['drive']['width']
+        for k,c in self.drive.items():
+            with QSignalBlocker(c): c.setValue(data['drive'][k])
+        self.updateChassis()
+        for p in self.parts:self.addItem(p)
+        self.readSelection()
+
+    def apply(self):
+        try: data=self.profile(); self.validate(data)
+        except Exception as e: QMessageBox.warning(self,'Robot Builder',str(e)); return
+        c=self.canvas; r=c.robot
+        c.pauseRobotPreview(); c.preview_paused=False
+        for k,v in data['drive'].items():setattr(r,k,v)
+        r.parts=copy.deepcopy(data['parts']); p=next(p for p in r.parts if p['primary'])
+        r.sensor_x_mm=p['x']; r.sensor_y_mm=p['y']; r.sensor_diameter_mm=p['sensing']
+        c.robot_item.vertices=[QPointF(x*c.pixels_per_mm,y*c.pixels_per_mm) for x,y in data['vertices']]
+        c.robot_item.rebuildHandles(); c.robot_item.refreshShape(); c.robot_item.updateSensorPosition()
+        c.refreshBuilderParts(); c.refreshRobotPreview(); self.accept()
+
+
 class Robot:
     def __init__(self, width, length, wheel_diameter, axle_track, initial_heading=0):
         self.width = width
@@ -209,6 +467,7 @@ class Robot:
         self.sensor_x_mm = 80.0
         self.sensor_y_mm = 0.0
         self.sensor_diameter_mm = 18.0
+        self.parts = []
 
 class RobotLightSensor(QGraphicsEllipseItem):
     def __init__(self, robot_item):
@@ -542,6 +801,46 @@ class PathSegment(QGraphicsLineItem):
         angle_radians = math.atan2(dy, dx)
         self.angle_degrees = math.degrees(angle_radians)
 
+FIELD_TYPES = {
+    "Movable block": (40, 40, "#d97706"), "Static obstacle": (80, 40, "#64748b"),
+    "Barrier": (120, 15, "#475569"), "Container": (100, 80, "#0d9488"),
+    "Target zone": (120, 100, "#16a34a"), "Colour marker": (30, 30, "#eab308"),
+    "Stackable object": (50, 50, "#9333ea"), "Hinged object": (75, 30, "#2563eb"),
+    "Sliding object": (75, 30, "#0891b2"), "Terrain region": (150, 100, "#a16207"),
+    "Grid / matrix": (150, 120, "#db2777"), "Custom object": (60, 60, "#64748b")
+}
+
+class FieldPalette(BuilderPalette):
+    def startDrag(self, actions):
+        item = self.currentItem()
+        if item is None: return
+        mime = QMimeData(); mime.setData("application/x-wro-field-part", item.text().encode())
+        drag = QDrag(self); drag.setMimeData(mime); drag.exec(Qt.DropAction.CopyAction)
+
+class FieldObject(QGraphicsRectItem):
+    def __init__(self, canvas, data):
+        super().__init__(); self.canvas=canvas; self.data=copy.deepcopy(data); self.syncing=True
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.label_item=QGraphicsSimpleTextItem(self); self.label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.refresh(); self.syncing=False
+
+    def refresh(self):
+        old=self.syncing; self.syncing=True
+        p=self.data; scale=self.canvas.pixels_per_mm; l=p['length']*scale; w=p['width']*scale
+        self.setRect(-l/2,-w/2,l,w); color=QColor(p['color']); color.setAlpha(45 if p['kind'] in ('Target zone','Terrain region','Grid / matrix') else 155)
+        self.setBrush(QBrush(color)); pen=QPen(QColor(p['color']),2)
+        if p['kind'] in ('Target zone','Terrain region','Grid / matrix'): pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen); self.setZValue(0.8 if p['kind'] in ('Target zone','Terrain region','Grid / matrix') else 2.5)
+        self.setPos(p['x']*scale,p['y']*scale); self.setRotation(p['angle'])
+        self.label_item.setText(p['name']); self.label_item.setBrush(QBrush(QColor('#334155'))); self.label_item.setPos(-l/2,-w/2-self.label_item.boundingRect().height())
+        self.syncing=old
+
+    def itemChange(self, change, value):
+        if change==QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not getattr(self,'syncing',True):
+            self.data['x']=value.x()/self.canvas.pixels_per_mm; self.data['y']=value.y()/self.canvas.pixels_per_mm
+            self.canvas.itemSelected.emit(self)
+        return super().itemChange(change,value)
+
 class RobotCanvas(QGraphicsView):
     itemSelected = Signal(object)
     geometryChanged = Signal(object)
@@ -562,6 +861,8 @@ class RobotCanvas(QGraphicsView):
         self.next_waypoint_id = 0
         self.waypoints = []
         self.segments = []
+        self.field_objects = []
+        self.setAcceptDrops(True)
 
         self.pixels_per_mm = 0.67739204064
         self.show_coordinate_grid = True
@@ -668,14 +969,16 @@ class RobotCanvas(QGraphicsView):
             elif isinstance(item, PathSegment):
                 self.itemSelected.emit(item)
                 # print(f"{item.start_waypoint, item.end_waypoint}")
-            elif isinstance(item, RobotPolygon):
+            elif isinstance(item, (RobotPolygon, FieldObject)):
                 self.itemSelected.emit(item)
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
 
             for item in selected_items:
-                if isinstance(item, Waypoint):
+                if isinstance(item, FieldObject):
+                    self.field_objects.remove(item); self.scene.removeItem(item)
+                elif isinstance(item, Waypoint):
                     copy_of_connected_segments = list(item.connected_segments)
                     for segment in copy_of_connected_segments:
                         self.removeSegment(segment)
@@ -891,7 +1194,7 @@ class RobotCanvas(QGraphicsView):
         if isinstance(item, PathSegment):
             return super().mousePressEvent(event)
 
-        if item is not None and isinstance(item, QGraphicsPixmapItem)==False:
+        if item is not None and not isinstance(item, (QGraphicsPixmapItem, FieldObject)):
             return super().mousePressEvent(event)
 
         scene_pos = self.mapToScene(viewport_pos)
@@ -920,6 +1223,59 @@ class RobotCanvas(QGraphicsView):
             self.scene.addItem(pathsegment)
         self.refreshRobotPreview()
         self.geometryChanged.emit(waypoint)
+    def addFieldObject(self, kind, point):
+        l,w,color=FIELD_TYPES[kind]; scale=self.pixels_per_mm
+        data=dict(kind=kind,name=kind,length=l,width=w,height=0.0,color=color,x=point.x()/scale,y=point.y()/scale,angle=0.0)
+        item=FieldObject(self,data); self.field_objects.append(item); self.scene.addItem(item); self.scene.clearSelection(); item.setSelected(True)
+        return item
+
+    def dragEnterEvent(self,event):
+        if event.mimeData().hasFormat("application/x-wro-field-part"): event.acceptProposedAction()
+        else: super().dragEnterEvent(event)
+
+    def dragMoveEvent(self,event):
+        if event.mimeData().hasFormat("application/x-wro-field-part"): event.acceptProposedAction()
+        else: super().dragMoveEvent(event)
+
+    def dropEvent(self,event):
+        kind=bytes(event.mimeData().data("application/x-wro-field-part")).decode() if event.mimeData().hasFormat("application/x-wro-field-part") else None
+        if kind in FIELD_TYPES:
+            self.addFieldObject(kind,self.mapToScene(event.position().toPoint())); event.acceptProposedAction()
+        else: super().dropEvent(event)
+
+    def editSnapshot(self):
+        wp_keys=('intersection_count','intersection_direction','turn_override_enabled','turn_angle_deg','turn_clip_deg')
+        seg_keys=('movement_type','speed_mm_s','turn_speed_deg_s','line_target','kp','ki','kd','line_side','line_stop','reverse','imported_estimate')
+        return dict(robot=copy.deepcopy(vars(self.robot)), pose=(self.robot_item.pos().x(),self.robot_item.pos().y(),self.robot_item.rotation()), vertices=[(p.x(),p.y()) for p in self.robot_item.vertices], next_id=self.next_waypoint_id, waypoints=[dict(id=w.waypoint_id,x=w.pos().x(),y=w.pos().y(),label=w.label,attrs={k:getattr(w,k) for k in wp_keys}) for w in self.waypoints], segments=[dict(start=t.start_waypoint.waypoint_id,end=t.end_waypoint.waypoint_id,attrs={k:getattr(t,k) for k in seg_keys}) for t in self.segments], objects=[copy.deepcopy(o.data) for o in self.field_objects])
+
+    def restoreEditSnapshot(self,data):
+        self.resetRobotPreview(); self.syncing_start=True
+        try:
+            with QSignalBlocker(self), QSignalBlocker(self.scene):
+                self.scene.clearSelection()
+                for t in list(self.segments): self.removeSegment(t)
+                for w in self.waypoints: self.scene.removeItem(w)
+                for o in self.field_objects: self.scene.removeItem(o)
+                self.waypoints=[]; self.field_objects=[]
+                vars(self.robot).update(copy.deepcopy(data['robot']))
+                self.robot_item.vertices=[QPointF(x,y) for x,y in data['vertices']]
+                self.robot_item.selected_vertex=None; self.robot_item.rebuildHandles(); self.robot_item.refreshShape(); self.robot_item.updateSensorPosition()
+                x,y,a=data['pose']; self.robot_item.setPos(x,y); self.robot_item.setRotation(a); self.refreshBuilderParts()
+                by_id={}
+                for d in data['waypoints']:
+                    w=Waypoint(d['id'],d['x'],d['y'],label=d['label']); by_id[d['id']]=w
+                    for k,v in d['attrs'].items(): setattr(w,k,v)
+                    self.waypoints.append(w); self.scene.addItem(w)
+                for d in data['segments']:
+                    t=PathSegment(by_id[d['start']],by_id[d['end']],self.pixels_per_mm)
+                    for k,v in d['attrs'].items(): setattr(t,k,v)
+                    t.updateMovementAppearance(); self.segments.append(t); self.scene.addItem(t)
+                for d in data['objects']:
+                    o=FieldObject(self,d); self.field_objects.append(o); self.scene.addItem(o)
+                self.next_waypoint_id=data['next_id']
+        finally: self.syncing_start=False
+        self.refreshRobotPreview(); self.geometryChanged.emit(None); self.onSelectionChanged(); self.viewport().update()
+
     def importField(self):
         file_path, selected_filter = QFileDialog.getOpenFileName(self, "Import WRO Field", "", "PDF Files (*.pdf)")
         if file_path:
@@ -957,6 +1313,7 @@ class RobotCanvas(QGraphicsView):
             self.background = item
             self.background_image = image
             self.track_mask = None
+            if self.track_debug_item is not None: self.scene.removeItem(self.track_debug_item)
             self.track_debug_item = None
             self.scene.addItem(item)
             if self.track_debug_enabled:
@@ -1230,6 +1587,22 @@ class RobotCanvas(QGraphicsView):
         self.preview_index = index
         self.preview_mode = mode
         self.refreshRobotPreview()
+
+    def refreshBuilderParts(self):
+        for parent in (self.robot_item, self.preview_item):
+            for item in getattr(parent, 'builder_parts', []):
+                if item.scene() is not None: item.scene().removeItem(item)
+            parent.builder_parts = []
+            for p in self.robot.parts:
+                if p['primary']: continue
+                scale = self.pixels_per_mm
+                l, w = p['length']*scale, p['width']*scale
+                item = QGraphicsRectItem(-l/2, -w/2, l, w, parent)
+                color = QColor(PART_TYPES[p['kind']][2]); color.setAlpha(110)
+                item.setBrush(QBrush(color)); item.setPen(QPen(QColor('#475569'), 1))
+                item.setPos(p['x']*scale, p['y']*scale); item.setRotation(p['angle']); item.setZValue(2)
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                parent.builder_parts.append(item)
 
     def refreshRobotPreview(self, item=None):
         if item is not None and self.preview_playing:
@@ -1960,6 +2333,10 @@ class MainWindow(QMainWindow):
         toolbar.addAction(import_action)
         toolbar.addAction(export_action)
         toolbar.addAction(import_code_action)
+        builder_action = QAction("Robot Builder…", self)
+        builder_action.triggered.connect(lambda: RobotBuilder(self.canvas, self).exec())
+        toolbar.addAction(builder_action)
+        self.menuBar().addMenu("Robot").addAction(builder_action)
         auto_snap_action = QAction("Auto-align Intersection Waypoints", self)
         auto_snap_action.triggered.connect(self.canvas.snapAllIntersectionWaypoints)
         toolbar.addAction(auto_snap_action)
@@ -1977,6 +2354,7 @@ class MainWindow(QMainWindow):
         track_debug_action.toggled.connect(self.canvas.setTrackDebugVisible)
         toolbar.addAction(track_debug_action)
         view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction(self.properties_dock.toggleViewAction())
         view_menu.addAction(track_debug_action)
         grid_action = QAction("Show 100 mm Coordinate Grid", self)
         grid_action.setCheckable(True)
@@ -2001,6 +2379,90 @@ class MainWindow(QMainWindow):
 
         toolbar.addAction(select_action)
         toolbar.addAction(waypoint_action)
+
+        self.setupFieldEditor(view_menu)
+        self.undo_history=[self.canvas.editSnapshot()]; self.redo_history=[]; self.restoring_history=False
+        edit_menu=self.menuBar().addMenu("Edit")
+        self.undo_action=QAction("Undo",self); self.undo_action.setShortcuts(QKeySequence.StandardKey.Undo); self.undo_action.triggered.connect(self.undoEdit); edit_menu.addAction(self.undo_action)
+        self.redo_action=QAction("Redo",self); self.redo_action.setShortcuts(QKeySequence.StandardKey.Redo); self.redo_action.triggered.connect(self.redoEdit); edit_menu.addAction(self.redo_action)
+        self.history_timer=QTimer(self); self.history_timer.setInterval(120); self.history_timer.timeout.connect(self.captureEdit); self.history_timer.start()
+
+    def setupFieldEditor(self,view_menu):
+        self.field_dock=QDockWidget("Field Objects",self); panel=QWidget(); layout=QVBoxLayout(panel)
+        layout.addWidget(QLabel("Drag an object onto the mat, or double-click to add."))
+        self.field_palette=FieldPalette(); self.field_palette.addItems(list(FIELD_TYPES)); self.field_palette.setDragEnabled(True); layout.addWidget(self.field_palette)
+        self.field_palette.itemDoubleClicked.connect(lambda item: self.canvas.addFieldObject(item.text(),self.canvas.mapToScene(self.canvas.viewport().rect().center())))
+        self.field_group=QGroupBox("Selected object"); form=QFormLayout(self.field_group); layout.addWidget(self.field_group)
+        self.field_name=QLineEdit(); form.addRow("Name",self.field_name); self.field_name.textEdited.connect(self.writeFieldObject)
+        self.field_controls={}
+        for key,label,low,high in [('x','X',-10000,10000),('y','Y',-10000,10000),('length','Length',1,3000),('width','Width',1,3000),('height','Height',0,3000),('angle','Rotation',-360,360)]:
+            c=QDoubleSpinBox(); c.setRange(low,high); c.setDecimals(1); c.setSuffix('°' if key=='angle' else ' mm'); form.addRow(label,c); self.field_controls[key]=c; c.valueChanged.connect(self.writeFieldObject)
+        self.field_color=QPushButton("Change colour…"); self.field_color.clicked.connect(self.chooseFieldColor); form.addRow(self.field_color)
+        duplicate=QPushButton("Duplicate"); duplicate.clicked.connect(self.duplicateFieldObject); form.addRow(duplicate)
+        remove=QPushButton("Delete object"); remove.clicked.connect(self.deleteFieldObject); form.addRow(remove)
+        layout.addStretch(); self.field_dock.setWidget(panel); self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,self.field_dock)
+        view_menu.addAction(self.field_dock.toggleViewAction()); self.field_group.setEnabled(False)
+        self.field_loading=False; self.canvas.itemSelected.connect(self.readFieldObject)
+
+    def selectedFieldObject(self):
+        items=self.canvas.scene.selectedItems(); return items[0] if len(items)==1 and isinstance(items[0],FieldObject) else None
+
+    def readFieldObject(self,item):
+        if not isinstance(item,FieldObject): item=None
+        self.field_group.setEnabled(item is not None)
+        if item is None: return
+        self.field_loading=True
+        try:
+            self.field_name.setText(item.data['name'])
+            for k,c in self.field_controls.items(): c.setValue(item.data[k])
+            self.field_color.setStyleSheet('background-color: '+item.data['color'])
+        finally: self.field_loading=False
+
+    def writeFieldObject(self,*args):
+        item=self.selectedFieldObject()
+        if self.field_loading or item is None: return
+        item.data.update(name=self.field_name.text(),**{k:c.value() for k,c in self.field_controls.items()}); item.refresh()
+
+    def chooseFieldColor(self):
+        item=self.selectedFieldObject()
+        if item is None: return
+        color=QColorDialog.getColor(QColor(item.data['color']),self)
+        if color.isValid(): item.data['color']=color.name(); item.refresh(); self.readFieldObject(item)
+
+    def duplicateFieldObject(self):
+        old=self.selectedFieldObject()
+        if old is None:return
+        d=copy.deepcopy(old.data); d['x']+=20; d['y']+=20; d['name']+=' copy'
+        item=FieldObject(self.canvas,d); self.canvas.field_objects.append(item); self.canvas.scene.addItem(item); self.canvas.scene.clearSelection(); item.setSelected(True)
+
+    def deleteFieldObject(self):
+        item=self.selectedFieldObject()
+        if item is not None: self.canvas.field_objects.remove(item); self.canvas.scene.removeItem(item); self.readFieldObject(None)
+
+    def captureEdit(self,force=False):
+        if self.restoring_history or (not force and (QApplication.mouseButtons()!=Qt.MouseButton.NoButton or QApplication.activeModalWidget() is not None)): return
+        state=self.canvas.editSnapshot()
+        if state!=self.undo_history[-1]:
+            self.undo_history.append(state); self.undo_history=self.undo_history[-101:]; self.redo_history.clear()
+        self.undo_action.setEnabled(True); self.redo_action.setEnabled(bool(self.redo_history))
+
+    def undoEdit(self):
+        self.captureEdit(True)
+        if len(self.undo_history)<2:return
+        self.redo_history.append(self.undo_history.pop()); self.applyHistory(self.undo_history[-1])
+
+    def redoEdit(self):
+        self.captureEdit(True)
+        if not self.redo_history:return
+        state=self.redo_history.pop(); self.undo_history.append(state); self.applyHistory(state)
+
+    def applyHistory(self,state):
+        self.restoring_history=True
+        try: self.canvas.restoreEditSnapshot(state)
+        finally: self.restoring_history=False
+        # Use restored state as baseline (normalisation may update derived dimensions).
+        self.undo_history[-1]=self.canvas.editSnapshot()
+        self.undo_action.setEnabled(True); self.redo_action.setEnabled(bool(self.redo_history))
 
     def importPybricksRoute(self):
         dialog = QDialog(self)
@@ -2096,6 +2558,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def updateProperties(self, item):
+        if isinstance(item, FieldObject):
+            item=None
         if isinstance(item, Waypoint):
             id = item.waypoint_id
             self.selected_label.setText(f"Selected Item: Waypoint {id}")

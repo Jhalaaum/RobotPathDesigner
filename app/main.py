@@ -2,8 +2,12 @@
 import sys
 import math
 import ast
+from navigation_ui import NavigationOverlay
+from actions import Drive, Turn, LineTrack, TrackUntilIntersection, Program, from_pybricks, to_pybricks, to_movements
 import copy
 import json
+from pathlib import Path
+import random
 from types import SimpleNamespace
 
 from PySide6.QtWidgets import (
@@ -63,7 +67,7 @@ def generatePybricksRoute(waypoints, segments, robot):
     if abs(robot.wheel_diameter - 62.4) > 0.1 or abs(robot.axle_track - 190) > 0.1:
         warnings.append("Robot dimensions in the planner differ from the competition-day code (wheel 62.4 mm, axle 190 mm).")
 
-    calls = []
+    actions = []
     heading = float(robot.initial_heading)
     def angle_difference(a, b):
         return (a - b + 180.0) % 360.0 - 180.0
@@ -92,29 +96,24 @@ def generatePybricksRoute(waypoints, segments, robot):
         if abs(clipped - route_delta) > 5:
             warnings.append(f"Waypoint {start.waypoint_id}: turn differs from the drawn route; check robot orientation.")
         if abs(clipped) >= 0.05:
-            calls.append(f"turn({format_number(clipped)})")
+            actions.append(Turn(float(format_number(clipped))))
         heading = target_heading
 
         if segment.movement_type == "Drive Straight":
             if distance_mm >= 0.5:
-                calls.append(f"gyroDriveStraight({format_number(signed_distance_mm)})")
+                actions.append(Drive(float(format_number(signed_distance_mm))))
             else:
                 warnings.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has negligible distance.")
         elif segment.movement_type == "Line Follow (PID)":
             if segment.line_side not in ("left", "right"):
                 errors.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has an unknown line side.")
                 continue
-            if segment.line_side == "left":
-                side_argument = 'side="left"'
-            else:
-                side_argument = ""
             if segment.line_stop == "Distance":
-                arguments = format_number(signed_distance_mm) + (", " + side_argument if side_argument else "")
-                calls.append(f"singleLineTrackByDist({arguments})")
+                actions.append(LineTrack(float(format_number(signed_distance_mm)), segment.line_side))
             elif segment.line_stop == "Intersection":
                 if int(end.intersection_count) != 1:
                     errors.append(f"Waypoint {end.waypoint_id} requests intersection #{end.intersection_count}, but the Pybricks helper stops at the first intersection.")
-                calls.append(f"singleLineTrackTillIntersection({side_argument})" if side_argument else "singleLineTrackTillIntersection()")
+                actions.append(TrackUntilIntersection(segment.line_side))
                 warnings.append(f"Waypoint {end.waypoint_id}: no automatic post-detection sensor-to-centre advance is exported; add a calibrated movement before turning if needed.")
             else:
                 errors.append(f"Segment {start.waypoint_id}->{end.waypoint_id} has an unknown line stop.")
@@ -128,77 +127,28 @@ def generatePybricksRoute(waypoints, segments, robot):
     final = waypoints[-1]
     if final.turn_override_enabled and abs(float(final.turn_angle_deg)) > 0.05:
         angle = max(-float(final.turn_clip_deg), min(float(final.turn_clip_deg), float(final.turn_angle_deg)))
-        calls.append(f"turn({format_number(angle)})")
+        actions.append(Turn(float(format_number(angle))))
     warnings.append("The output contains only movement calls; paste them into your existing Pybricks program after its helper definitions.")
-    code = "\n".join(calls) + "\n"
+    code = ""
     try:
+        code = to_pybricks(Program(tuple(actions)))
         compile(code, "<minimal_pybricks_route>", "exec")
-    except SyntaxError as exc:
-        errors.append(f"Generated Python syntax error: {exc}")
+    except (SyntaxError, ValueError) as exc:
+        errors.append(f"Generated action error: {exc}")
     return code, warnings, errors
 
 def parsePybricksRoute(code, intersection_distance_mm=200.0, auto_intersections=False):
-    """Parse a restricted sequence of Pybricks movement calls. Never execute pasted code."""
+    """Parse through the shared action model; never execute pasted code."""
     try:
-        tree = ast.parse(code, mode="exec")
+        program = from_pybricks(code)
+        statements = [stmt for stmt in ast.parse(code).body if not isinstance(stmt, ast.Pass)]
     except SyntaxError as exc:
         raise ValueError(f"Python syntax error on line {exc.lineno}: {exc.msg}") from exc
-    movements = []
-    warnings = []
-    permitted = {"gyroDriveStraight", "motorDriveStraight", "turn", "singleLineTrackByDist", "singleLineTrackTillIntersection"}
-    def number(node, line):
-        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
-            result = float(node.value)
-        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-            result = number(node.operand, line) * (-1 if isinstance(node.op, ast.USub) else 1)
-        else:
-            raise ValueError(f"Line {line}: movement values must be numeric literals, not expressions or variables.")
-        if not math.isfinite(result):
-            raise ValueError(f"Line {line}: non-finite number is not supported.")
-        return result
-    for statement in tree.body:
-        if isinstance(statement, ast.Pass):
-            continue
-        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call) or not isinstance(statement.value.func, ast.Name):
-            raise ValueError(f"Line {statement.lineno}: paste only movement calls (no imports, loops, assignments, or function definitions).")
-        call = statement.value
-        name = call.func.id
-        if name not in permitted:
-            raise ValueError(f"Line {statement.lineno}: unsupported command {name}(). Supported: {', '.join(sorted(permitted))}.")
-        allowed_kwargs = {"side"} if name.startswith("singleLineTrack") else set()
-        if len(call.args) > (0 if name == "singleLineTrackTillIntersection" else 1):
-            raise ValueError(f"Line {statement.lineno}: too many positional arguments for {name}().")
-        kwargs = {}
-        for kw in call.keywords:
-            if kw.arg not in allowed_kwargs or kw.arg in kwargs:
-                raise ValueError(f"Line {statement.lineno}: unsupported or duplicate argument {kw.arg!r}.")
-            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
-                raise ValueError(f"Line {statement.lineno}: side must be 'left' or 'right'.")
-            kwargs[kw.arg] = kw.value.value
-        side = kwargs.get("side", "right")
-        if side not in ("left", "right"):
-            raise ValueError(f"Line {statement.lineno}: side must be 'left' or 'right'.")
-        if name != "singleLineTrackTillIntersection" and not call.args:
-            raise ValueError(f"Line {statement.lineno}: {name}() requires a distance or angle.")
-        value = number(call.args[0], statement.lineno) if call.args else None
-        if name == "turn":
-            movements.append({"type": "turn", "angle": value})
-        elif name == "singleLineTrackTillIntersection":
-            if intersection_distance_mm <= 0:
-                raise ValueError("Intersection display distance must be positive.")
-            movements.append({"type": "line", "distance": float(intersection_distance_mm), "stop": "Intersection", "side": side, "estimated": True, "source_line": statement.lineno, "auto_detect": bool(auto_intersections)})
-            if not auto_intersections:
-                warnings.append(f"Line {statement.lineno}: intersection distance is unknown; displaying an estimated {intersection_distance_mm:g} mm segment. Adjust the waypoint on the field.")
-        else:
-            if abs(value) < 0.001:
-                warnings.append(f"Line {statement.lineno}: zero-distance movement omitted.")
-                continue
-            movement_type = "line" if name == "singleLineTrackByDist" else "straight"
-            movements.append({"type": movement_type, "distance": value, "stop": "Distance", "side": side, "estimated": False})
-    if not movements:
-        raise ValueError("No usable movement calls found.")
-    if not any(m["type"] != "turn" for m in movements):
-        raise ValueError("At least one drive or line-track command is needed to draw a route.")
+    movements, warnings = to_movements(program, intersection_distance_mm, auto_intersections)
+    source_lines = [stmt.lineno for stmt, action in zip(statements, program.actions) if not isinstance(action, (Drive, LineTrack)) or abs(action.distance) >= 0.001]
+    for movement, source_line in zip(movements, source_lines):
+        if movement.get("estimated"):
+            movement["source_line"] = source_line
     return movements, warnings
 
 PART_TYPES = {
@@ -810,6 +760,49 @@ FIELD_TYPES = {
     "Grid / matrix": (150, 120, "#db2777"), "Custom object": (60, 60, "#64748b")
 }
 
+def senior2026Objects(scale):
+    """A reproducible geometric test fixture; coordinates refer to the 1600px field."""
+    objects = []
+    def add(kind, name, x, y, l, w, color, height=0, angle=0):
+        objects.append(dict(kind=kind, name=name, x=x/scale, y=y/scale, length=l/scale, width=w/scale, height=height, angle=angle, color=color))
+    colors = {"White":"#ffffff", "Green":"#21864a", "Blue":"#245bbb", "Yellow":"#f4d526"}
+    for name, y in [("White",118),("Green",226),("Blue",334),("Yellow",442)]:
+        for row in range(2):
+            for col in range(3):
+                add("Movable block", f"{name[0]}T{row*3+col+1}", 83+43*col, y+43*row, 21,21,colors[name], 16)
+    rng = random.Random(2026)
+    for name,y in [("Yellow",58),("Green",228),("Blue",398),("White",567)]:
+        for row in range(5):
+            for col in range(2):
+                add("Movable block",f"{name[0]}C{row*2+col+1}",1490+44*col+rng.uniform(-4,4),y+21+26*row+rng.uniform(-3,3),29,7,colors[name],9.6,rng.uniform(-18,18))
+    for name, x,y,l,w in [("Blue",659,302,68,314),("Green",941,302,68,314),("Yellow",800,426,214,67),("White",800,178,214,68)]:
+        add("Target zone",name+" cement target",x,y,l,w,colors[name])
+    for name,x,y,l,w in [("Start",125,647,170,170),("Sponsor",406,716,140,110),("Parking",1100,452,202,196)]:
+        add("Target zone",name,x,y,l,w,"#16a34a")
+    add("Grid / matrix","Mosaic frame (3 x 4)",800,302,144,110,"#64748b",10)
+    pattern=["Blue","Yellow","Yellow","Green","White","Blue","Green","White","Yellow","Green","Blue","White"]
+    for row in range(3):
+        for col in range(4):
+            name=pattern[row*4+col]
+            add("Colour marker",f"M{row+1}.{col+1}",746+36*col,266+36*row,28,28,colors[name])
+    add("Custom object","Rectangular trowel",605,718,86,44,"#d9534f",35)
+    add("Container","Cement bowl",800,719,33,33,"#e2e8f0",25)
+    add("Custom object","Masonry trowel",1002,718,45,64,"#d9534f",35)
+    for i,(x,y,angle,color) in enumerate([(603,118,0,"#c43838"),(988,97,0,"#20252e"),(602,507,0,"#20252e"),(987,508,0,"#c43838")],1):
+        add("Barrier",f"Barrier {i}",x,y,72,13,color,65,angle)
+    return objects
+
+
+def senior2026Parts():
+    parts=[]
+    for kind,name,x,y,port in [("Hub / gyro","Prime Hub",0,0,""),("Wheel","Left wheel",0,-95,""),("Wheel","Right wheel",0,95,""),("Drive motor","Left drive",-10,-65,"B"),("Drive motor","Right drive",-10,65,"F"),("Colour sensor","Line / mosaic sensor",80,0,"E"),("Attachment motor","Claw motor",60,-45,"A"),("Attachment motor","Deposit motor",-60,0,"C"),("Attachment motor","Slider motor",60,45,"D"),("Gripper","Claw",125,0,""),("Linear slider","Scanner carriage",90,0,""),("Cargo bay","Tile storage",-65,0,"")]:
+        p=newRobotPart(kind,x,y); p.update(name=name,port=port,primary=kind=="Colour sensor")
+        if port=="B": p["direction"]="Counterclockwise"
+        if kind=="Wheel": p.update(length=62.4,width=26.0)
+        parts.append(p)
+    return parts
+
+
 class FieldPalette(BuilderPalette):
     def startDrag(self, actions):
         item = self.currentItem()
@@ -1126,6 +1119,14 @@ class RobotCanvas(QGraphicsView):
                 position += QPointF(math.cos(radians) * movement["distance"] * self.pixels_per_mm, math.sin(radians) * movement["distance"] * self.pixels_per_mm)
         return warnings
 
+    def loadActionProgram(self, program, intersection_distance_mm=200.0, auto_intersections=False, origin_scene=None, initial_heading=None):
+        """Bridge for future automatic navigation; current canvas is navigation-only."""
+        movements, warnings = to_movements(program, intersection_distance_mm, auto_intersections)
+        if auto_intersections:
+            warnings.extend(self.resolveImportedIntersections(movements, origin_scene, initial_heading))
+        self.loadRouteMovements(movements, origin_scene, initial_heading)
+        return warnings
+
     def loadRouteMovements(self, movements, origin_scene=None, initial_heading=None):
         """Replace the editable route from parsed calls (millimetres, heading in screen degrees)."""
         self.resetRobotPreview()
@@ -1276,8 +1277,11 @@ class RobotCanvas(QGraphicsView):
         finally: self.syncing_start=False
         self.refreshRobotPreview(); self.geometryChanged.emit(None); self.onSelectionChanged(); self.viewport().update()
 
-    def importField(self):
-        file_path, selected_filter = QFileDialog.getOpenFileName(self, "Import WRO Field", "", "PDF Files (*.pdf)")
+    def importField(self, file_path=None):
+        if not isinstance(file_path, (str, Path)):
+            file_path, selected_filter = QFileDialog.getOpenFileName(self, "Import WRO Field", "", "PDF Files (*.pdf)")
+        if file_path:
+            file_path = str(file_path)
         if file_path:
             document = QPdfDocument(self)
             error = document.load(file_path)
@@ -1307,6 +1311,8 @@ class RobotCanvas(QGraphicsView):
             item = QGraphicsPixmapItem(pixmap)
             item.setZValue(0)
 
+            overlay = getattr(self, "navigation_overlay", None)
+            if overlay is not None: overlay.clear()
             if self.background is not None:
                 self.scene.removeItem(self.background)
 
@@ -1316,14 +1322,17 @@ class RobotCanvas(QGraphicsView):
             if self.track_debug_item is not None: self.scene.removeItem(self.track_debug_item)
             self.track_debug_item = None
             self.scene.addItem(item)
+            if overlay is not None: overlay.field_changed()
             if self.track_debug_enabled:
                 self.updateTrackDebugOverlay()
             self.scene.setSceneRect(self.scene.itemsBoundingRect())
 
             self.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
             self.zoom_level = self.transform().m11()
+            return True
         else:
             print("No file selected")
+        return False
 
     def setTrackDebugVisible(self, enabled):
         self.track_debug_enabled = enabled
@@ -2361,6 +2370,7 @@ class MainWindow(QMainWindow):
         grid_action.setChecked(True)
         grid_action.toggled.connect(lambda visible: (setattr(self.canvas, "show_coordinate_grid", visible), self.canvas.viewport().update()))
         view_menu.addAction(grid_action)
+        self.canvas.navigation_overlay = NavigationOverlay(self, view_menu)
 
         tool_group = QActionGroup(self)
         tool_group.setExclusive(True)
@@ -2380,12 +2390,42 @@ class MainWindow(QMainWindow):
         toolbar.addAction(select_action)
         toolbar.addAction(waypoint_action)
 
+        demo_menu=self.menuBar().addMenu("Examples")
+        demo_action=QAction("Load 2026 Senior — Mosaic Masters",self)
+        demo_action.triggered.connect(lambda: self.loadSenior2026Demo())
+        demo_menu.addAction(demo_action)
         self.setupFieldEditor(view_menu)
         self.undo_history=[self.canvas.editSnapshot()]; self.redo_history=[]; self.restoring_history=False
         edit_menu=self.menuBar().addMenu("Edit")
         self.undo_action=QAction("Undo",self); self.undo_action.setShortcuts(QKeySequence.StandardKey.Undo); self.undo_action.triggered.connect(self.undoEdit); edit_menu.addAction(self.undo_action)
         self.redo_action=QAction("Redo",self); self.redo_action.setShortcuts(QKeySequence.StandardKey.Redo); self.redo_action.triggered.connect(self.redoEdit); edit_menu.addAction(self.redo_action)
         self.history_timer=QTimer(self); self.history_timer.setInterval(120); self.history_timer.timeout.connect(self.captureEdit); self.history_timer.start()
+
+    def loadSenior2026Demo(self, confirm=True):
+        if confirm and QMessageBox.question(self,"Load example","Replace the current field, robot and route with the 2026 Senior test fixture?") != QMessageBox.StandardButton.Yes: return
+        c=self.canvas
+        path=Path(__file__).resolve().with_name("WRO-2026-GameMat-Senior-Printing-File(3).pdf")
+        if not path.exists():
+            selected,_=QFileDialog.getOpenFileName(self,"Locate 2026 Senior mat PDF","","PDF Files (*.pdf)")
+            if not selected: return
+            path=Path(selected)
+        if not c.importField(str(path)):
+            QMessageBox.warning(self,"Example","Could not load the game mat."); return
+        self.restoring_history=True
+        try:
+            scale=c.pixels_per_mm
+            state=c.editSnapshot()
+            state['robot'].update(width=250.0,length=250.0,wheel_diameter=62.4,axle_track=190.0,initial_heading=0.0,sensor_x_mm=80.0,sensor_y_mm=0.0,sensor_diameter_mm=18.0,parts=senior2026Parts())
+            state.update(pose=(430.0,595.5,0.0),vertices=[(-125*scale,-125*scale),(125*scale,-125*scale),(125*scale,125*scale),(-125*scale,125*scale)],waypoints=[],segments=[],next_id=0,objects=senior2026Objects(scale))
+            c.restoreEditSnapshot(state)
+            # Right edge of the long bottom horizontal track. Deliberately short debugging route.
+            moves=[dict(type='line',distance=100.0,stop='Distance',side='right',estimated=False),dict(type='line',distance=(605-430)/scale-100,stop='Intersection',side='right',estimated=False,target_scene=QPointF(605,595.5)),dict(type='straight',distance=100.0,stop='Distance',side='right',estimated=False),dict(type='straight',distance=-50.0,stop='Distance',side='right',estimated=False),dict(type='turn',angle=-90.0)]
+            c.loadRouteMovements(moves,QPointF(430,595.5),0.0)
+            c.scene.clearSelection(); c.scene.setSceneRect(c.background.boundingRect()); c.fitInView(c.background,Qt.AspectRatioMode.KeepAspectRatio); c.zoom_level=c.transform().m11()
+        finally:
+            self.restoring_history=False
+        self.undo_history=[c.editSnapshot()]; self.redo_history=[]; self.captureEdit(True)
+        self.statusBar().showMessage("2026 Senior example loaded — editable geometric test fixture, not a full mission solution.",12000)
 
     def setupFieldEditor(self,view_menu):
         self.field_dock=QDockWidget("Field Objects",self); panel=QWidget(); layout=QVBoxLayout(panel)
@@ -2821,7 +2861,9 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    demo = "--demo" in sys.argv
+    app = QApplication([arg for arg in sys.argv if arg != "--demo"])
     window = MainWindow()
     window.show()
+    if demo: QTimer.singleShot(0, lambda: window.loadSenior2026Demo(confirm=False))
     sys.exit(app.exec())

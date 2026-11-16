@@ -2371,6 +2371,8 @@ class MainWindow(QMainWindow):
         grid_action.toggled.connect(lambda visible: (setattr(self.canvas, "show_coordinate_grid", visible), self.canvas.viewport().update()))
         view_menu.addAction(grid_action)
         self.canvas.navigation_overlay = NavigationOverlay(self, view_menu)
+        from planner_ui import install_planner
+        install_planner(self)
 
         tool_group = QActionGroup(self)
         tool_group.setExclusive(True)

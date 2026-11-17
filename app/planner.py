@@ -161,6 +161,25 @@ def evaluate_candidate(start, actions, robot, pixels_per_mm):
     return estimate_execution_time(actions, robot)
 
 
+def generate_detour_candidates(start, destination, pixels_per_mm, collision_checker, max_waypoints=24):
+    """Fallback only: try a single corner waypoint around a buffered obstacle.
+    Every drive and turn is checked. This is not complete obstacle avoidance.
+    """
+    a=(start.x,start.y)
+    points=sorted(set(collision_checker.detour_waypoints()),
+                  key=lambda p: math.dist(a,p)+math.dist(p,destination))[:max_waypoints]
+    candidates=[]
+    for point in points:
+        for approach in generate_direct_candidates(start,point,pixels_per_mm):
+            if collision_checker.check_route(start,approach):
+                continue
+            middle=calculate_end_pose(start,approach,pixels_per_mm)
+            for departure in generate_direct_candidates(middle,destination,pixels_per_mm):
+                if not collision_checker.check_route(middle,departure):
+                    candidates.append(approach+departure)
+    return candidates
+
+
 def plan_navigation(start, destination, robot, pixels_per_mm, graph=None, collision_checker=None, **hybrid_options):
     cost = float('inf')
     best_candidate = None
@@ -176,6 +195,11 @@ def plan_navigation(start, destination, robot, pixels_per_mm, graph=None, collis
         if current_cost < cost:
             cost = current_cost
             best_candidate = candidate
+    if best_candidate is None and collision_checker is not None:
+        for candidate in generate_detour_candidates(start,destination,pixels_per_mm,collision_checker):
+            current_cost=evaluate_candidate(start,candidate,robot,pixels_per_mm)
+            if current_cost<cost:
+                best_candidate,cost=candidate,current_cost
     return (best_candidate, cost)
 
 

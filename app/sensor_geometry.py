@@ -61,10 +61,12 @@ def generate_line_acquisition(start,target,pixels_per_mm):
     return result
 
 
-def raster_edge_validator(rgb, pixels_per_mm, robot):
+def raster_edge_validator(rgb, pixels_per_mm, robot, min_match=0.90, max_gap_mm=10.0):
     """Return a nominal edge validator using the same dark-neutral threshold as extraction.
     Checks a pair of probes on opposite sides of the sensor path, not PID physics.
     """
+    if not 0 < min_match <= 1 or max_gap_mm < 0:
+        raise ValueError('Invalid raster validation tolerance')
     import numpy as np
     rgb=np.asarray(rgb)[:,:,:3].astype(np.int16)
     hi=rgb.max(axis=2); mask=(hi<90)&((hi-rgb.min(axis=2))<45)
@@ -79,8 +81,16 @@ def raster_edge_validator(rgb, pixels_per_mm, robot):
         probe=max(1.5,min(5.0,getattr(robot,'sensor_diameter_mm',18)/3))*pixels_per_mm
         sign=1 if leg.side=='right' else -1
         n=max(1,math.ceil(leg.distance_mm/5))
+        matches=[]
         for i in range(n+1):
             x=sx+leg.distance_mm*pixels_per_mm*i/n*ux; y=sy+leg.distance_mm*pixels_per_mm*i/n*uy
-            if not dark(x-sign*probe*nx,y-sign*probe*ny) or dark(x+sign*probe*nx,y+sign*probe*ny): return False
+            matches.append(dark(x-sign*probe*nx,y-sign*probe*ny) and not dark(x+sign*probe*nx,y+sign*probe*ny))
+        if not matches[0] or not matches[-1] or sum(matches)/len(matches)<min_match:
+            return False
+        consecutive=0
+        for match in matches:
+            consecutive=0 if match else consecutive+1
+            if consecutive*leg.distance_mm/n>max_gap_mm+1e-9:
+                return False
         return True
     return valid

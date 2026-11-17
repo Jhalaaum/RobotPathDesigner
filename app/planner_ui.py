@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
     QGraphicsView, QMessageBox, QSplitter, QWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QCheckBox, QGroupBox, QGraphicsItem)
 from actions import Drive, LineTrack, Program, to_pybricks
-from planner import (Pose, generate_direct_candidates, generate_hybrid_candidates,
+from planner import (Pose, generate_direct_candidates, generate_hybrid_candidates, generate_detour_candidates,
                      calculate_end_pose, evaluate_candidate, estimate_execution_time)
 import math
 import numpy as np
@@ -96,7 +96,13 @@ def open_planner(window):
         spin.setDecimals(2); spin.setRange(lo,hi); spin.setSingleStep(10); spin.setSuffix(' mm'); spin.setKeyboardTracking(False)
     cl.addWidget(QLabel('X →')); cl.addWidget(x); cl.addWidget(QLabel('Y ↓')); cl.addWidget(y)
     ll.addWidget(coords)
-    if len(canvas.waypoints)>1:
+    # The demo's existing debug route ends near a barrier. Start the planner
+    # at a known clear demonstration target; clicking the mat still overrides it.
+    is_demo=(abs(start.x-430.0)<1 and abs(start.y-595.5)<1 and
+             any(o.name == "Mosaic frame (3 x 4)" for _,o in obstacle_items))
+    if is_demo:
+        x.setValue(0); y.setValue((350.0-start.y)/scale)
+    elif len(canvas.waypoints)>1:
         end = canvas.background.mapFromScene(canvas.waypoints[-1].scenePos())
         x.setValue((end.x()-start.x)/scale); y.setValue((end.y()-start.y)/scale)
     else:
@@ -104,13 +110,13 @@ def open_planner(window):
     options = QHBoxLayout(); auto = QCheckBox('Auto-plan'); auto.setChecked(True); options.addWidget(auto)
     budget = QComboBox(); budget.addItem('Quick search',30); budget.addItem('Standard search',60); budget.addItem('Deeper search',180); budget.setCurrentIndex(1)
     options.addWidget(budget); generate = QPushButton('Generate routes'); options.addWidget(generate); rl.addLayout(options)
-    physical = QGroupBox("Physical constraints"); pl = QVBoxLayout(physical)
+    physical = QGroupBox("Physical constraints — draft defaults"); pl = QVBoxLayout(physical)
     check = QCheckBox("Check obstacles and mat boundary"); check.setChecked(True); pl.addWidget(check)
-    movable = QCheckBox("Include movable / mission objects"); movable.setChecked(True); pl.addWidget(movable)
-    settings = QHBoxLayout(); settings.addWidget(QLabel("Clearance")); margin=QDoubleSpinBox(); margin.setRange(0,50); margin.setValue(5); margin.setSuffix(" mm"); settings.addWidget(margin)
+    movable = QCheckBox("Include movable / mission objects"); movable.setToolTip("Off by default: demo mission-object locations are approximate. Enable for fixed, verified placements."); movable.setChecked(False); pl.addWidget(movable)
+    settings = QHBoxLayout(); settings.addWidget(QLabel("Clearance")); margin=QDoubleSpinBox(); margin.setRange(0,50); margin.setValue(3); margin.setSuffix(" mm"); settings.addWidget(margin)
     settings.addWidget(QLabel("Line width")); line_width=QDoubleSpinBox(); line_width.setRange(5,65); line_width.setValue(20); line_width.setSuffix(" mm"); settings.addWidget(line_width); pl.addLayout(settings)
-    raster = QCheckBox("Verify tracking edge against mat image"); raster.setChecked(True); pl.addWidget(raster); rl.addWidget(physical)
-    filters = QHBoxLayout(); filters.addWidget(QLabel('Show:')); filter_box = QComboBox(); filter_box.addItems(['All routes','Direct only','Hybrid only']); filters.addWidget(filter_box,1); rl.addLayout(filters)
+    raster = QCheckBox("Verify tracking edge against mat image"); raster.setChecked(True); raster.setToolTip("Check the predicted sensor path for a dark/light edge. Adjust line width if no tracking routes appear."); pl.addWidget(raster); rl.addWidget(physical)
+    filters = QHBoxLayout(); filters.addWidget(QLabel('Show:')); filter_box = QComboBox(); filter_box.addItems(['All routes','Non-tracking only','Hybrid only']); filters.addWidget(filter_box,1); rl.addLayout(filters)
     status = QLabel('Pick a destination to begin.'); status.setWordWrap(True); rl.addWidget(status)
     table = QTableWidget(0,5); table.setHorizontalHeaderLabels(['Route','Time (s)','Track (mm)','Actions','Cost'])
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -198,15 +204,18 @@ def open_planner(window):
                     choices.clear(); populate(); status.setText(f"Starting footprint violates clearance: {initial_hit.obstacle}. Adjust start, objects or clearance."); return
             hybrid = generate_hybrid_candidates(start,destination,graph,canvas.robot,max_pairs=budget.currentData(),sensor_aware=True,line_width_mm=line_width.value(),edge_validator=validator if raster.isChecked() else None,collision_checker=checker)
             direct=[a for a in direct if checker is None or checker.check_route(start,a) is None]
-            def score(routes):
+            detours=[]
+            if not direct and not hybrid and checker is not None:
+                detours=generate_detour_candidates(start,destination,scale,checker)
+            def score(routes, detour=False):
                 result=[]
                 for actions in routes:
                     track=sum(abs(a.distance) for a in actions if isinstance(a,LineTrack))
-                    label='Hybrid' if track else ('Reverse' if any(isinstance(a,Drive) and a.distance<0 for a in actions) else 'Forward')
+                    label='Detour' if detour else ('Hybrid' if track else ('Reverse' if any(isinstance(a,Drive) and a.distance<0 for a in actions) else 'Forward'))
                     result.append((evaluate_candidate(start,actions,canvas.robot,scale),estimate_execution_time(actions,canvas.robot),actions,track,label))
                 return sorted(result,key=lambda c:c[0])
-            choices[:] = sorted(score(direct)+score(hybrid)[:30],key=lambda c:c[0])
-            status.setText(f'{len(direct)} direct · {len(hybrid)} hybrid candidates. Showing up to 30 hybrid routes.' if choices else 'No feasible candidate found. Try deeper search, check line width, clearance, or obstacle placement. Obstacle detours are not yet generated explicitly.')
+            choices[:] = sorted(score(direct)+score(hybrid)[:30]+score(detours)[:12],key=lambda c:c[0])
+            status.setText((f'{len(direct)} direct · {len(hybrid)} hybrid · {len(detours)} detour candidates. Showing the best alternatives.' + (' Collision checks OFF.' if checker is None else '')) if choices else 'No feasible candidate found. Try deeper search, a different destination, or verify line width, robot footprint and obstacle placement. Single-corner detours are limited.')
             populate()
         except Exception as exc:
             choices.clear(); populate(); status.setText(f'Planning failed: {exc}')

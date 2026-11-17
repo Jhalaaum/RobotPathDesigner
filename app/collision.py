@@ -61,8 +61,20 @@ class CollisionChecker:
         self.scale=pixels_per_mm; self.step_mm=step_mm; self.step_deg=step_deg
         self.radius=max(math.hypot(x,y) for x,y in self.footprint)
         self.padding=(margin_mm+step_mm/2+1e-6)*pixels_per_mm
-        self.obstacles=[(o.name,prep(_polygon(o.polygon).buffer(self.padding))) for o in obstacles]
+        self.obstacle_bounds=[]
+        self.obstacles=[]
+        for o in obstacles:
+            polygon=_polygon(o.polygon).buffer(self.padding)
+            self.obstacle_bounds.append(polygon.bounds)
+            self.obstacles.append((o.name,prep(polygon)))
         self.bounds=prep(box(*bounds).buffer(-self.padding)) if bounds is not None else None
+
+    def detour_waypoints(self):
+        """Conservative corner hints, not a complete free-space search."""
+        gap=self.radius*self.scale+max(1.0, self.step_mm*self.scale)
+        for x0,y0,x1,y1 in self.obstacle_bounds:
+            yield from ((x0-gap,y0-gap),(x0-gap,y1+gap),
+                        (x1+gap,y0-gap),(x1+gap,y1+gap))
 
     def check_pose(self, pose, action_index=-1):
         p=_polygon(transform_polygon(self.footprint,pose,self.scale))

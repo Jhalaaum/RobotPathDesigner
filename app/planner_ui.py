@@ -5,9 +5,9 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
     QDoubleSpinBox, QPushButton, QComboBox, QPlainTextEdit, QGraphicsScene,
     QGraphicsView, QMessageBox, QSplitter, QWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QCheckBox, QGroupBox, QGraphicsItem)
-from actions import Drive, LineTrack, Program, to_pybricks
-from planner import (Pose, generate_direct_candidates, generate_hybrid_candidates, generate_detour_candidates,
-                     calculate_end_pose, evaluate_candidate, estimate_execution_time)
+from actions import Drive, LineTrack, TrackToIntersection, Program, to_pybricks
+from planner import (Pose, generate_navigation_alternatives, calculate_end_pose,
+                     evaluate_candidate, estimate_execution_time)
 import math
 import numpy as np
 from collision import CollisionChecker, Obstacle, transform_polygon
@@ -88,7 +88,7 @@ def open_planner(window):
     view = DestinationView(scene); view.setRenderHint(QPainter.RenderHint.Antialiasing)
     view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
     ll.addWidget(view, 1)
-    legend = QLabel('● Start     ◆ Destination     Blue: drive     Green: chassis tracking     Gold dots: sensor path')
+    legend = QLabel('● Start     ◆ Destination     Blue: drive     Green: chassis tracking     Gold dots: sensor path     ★: intersection stop')
     legend.setWordWrap(True); ll.addWidget(legend)
     coords = QGroupBox('Destination relative to start (mm)'); cl = QHBoxLayout(coords)
     x = QDoubleSpinBox(); y = QDoubleSpinBox()
@@ -116,6 +116,10 @@ def open_planner(window):
     settings = QHBoxLayout(); settings.addWidget(QLabel("Clearance")); margin=QDoubleSpinBox(); margin.setRange(0,50); margin.setValue(3); margin.setSuffix(" mm"); settings.addWidget(margin)
     settings.addWidget(QLabel("Line width")); line_width=QDoubleSpinBox(); line_width.setRange(5,65); line_width.setValue(20); line_width.setSuffix(" mm"); settings.addWidget(line_width); pl.addLayout(settings)
     raster = QCheckBox("Verify tracking edge against mat image"); raster.setChecked(True); raster.setToolTip("Check the predicted sensor path for a dark/light edge. Adjust line width if no tracking routes appear."); pl.addWidget(raster); rl.addWidget(physical)
+    preference = QCheckBox('Prefer useful line tracking (when a reasonable alternative)')
+    preference.setChecked(True)
+    preference.setToolTip('A modest, bounded ranking bonus for meaningful tracking sections. Short or long-detour routes receive no special advantage.')
+    rl.addWidget(preference)
     filters = QHBoxLayout(); filters.addWidget(QLabel('Show:')); filter_box = QComboBox(); filter_box.addItems(['All routes','Non-tracking only','Hybrid only']); filters.addWidget(filter_box,1); rl.addLayout(filters)
     status = QLabel('Pick a destination to begin.'); status.setWordWrap(True); rl.addWidget(status)
     table = QTableWidget(0,5); table.setHorizontalHeaderLabels(['Route','Time (s)','Track (mm)','Actions','Cost'])
@@ -145,6 +149,11 @@ def open_planner(window):
         pose = start
         for action in actions:
             nxt = calculate_end_pose(pose,(action,),scale)
+            if isinstance(action, TrackToIntersection):
+                marker = scene.addSimpleText('★')
+                marker.setBrush(QBrush(QColor('#f0a500')))
+                marker.setPos(nxt.x-7, nxt.y-17)
+                marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
             if isinstance(action,LineTrack):
                 a=math.radians(pose.heading); f=canvas.robot.sensor_x_mm*scale; r=canvas.robot.sensor_y_mm*scale
                 dx=f*math.cos(a)-r*math.sin(a); dy=f*math.sin(a)+r*math.cos(a)
@@ -175,12 +184,30 @@ def open_planner(window):
         cost, seconds, actions, track, label = visible[idx]
         redraw(actions); editor.setPlainText(to_pybricks(Program(actions)))
         end = calculate_end_pose(start,actions,scale)
-        summary.setText(f'{label} · {seconds:.2f} s estimated · {track:.0f} mm tracking · arrival heading {end.heading:.1f}°')
+        summary.setText(f'{label} · {seconds:.2f} s estimated · {track:.0f} mm tracking · arrival heading {end.heading:.1f}°' + (' · junction stop: predicted position only' if any(isinstance(a, TrackToIntersection) for a in actions) else ''))
         apply.setEnabled(bool(actions)); copy_btn.setEnabled(True)
 
     def populate(*_):
         mode = filter_box.currentText()
-        visible[:] = [c for c in choices if mode == 'All routes' or (mode == 'Hybrid only') == (c[3] > 0)]
+        filtered = [c for c in choices if mode == 'All routes' or (mode == 'Hybrid only') == (c[3] > 0)]
+        # Show the best strategy representatives first, rather than many almost
+        # identical paths that differ only by a few millimetres or milliseconds.
+        leaders, shown, per_label = [], [], {}
+        for c in filtered:
+            if c[4] not in per_label:
+                leaders.append(c)
+                per_label[c[4]] = 1
+        for c in filtered:
+            if c in leaders or per_label.get(c[4],0) >= 3:
+                continue
+            peers=[p for p in shown+leaders if p[4]==c[4]]
+            if any(abs(p[1]-c[1])<0.45 and abs(p[3]-c[3])<85
+                   and abs(len(p[2])-len(c[2]))<3 for p in peers):
+                continue
+            shown.append(c)
+            per_label[c[4]] = per_label.get(c[4],0)+1
+            if len(shown)>=18: break
+        visible[:] = leaders + shown
         table.blockSignals(True); table.setRowCount(len(visible))
         for row, (cost, seconds, actions, track, label) in enumerate(visible):
             for col, value in enumerate([label, f'{seconds:.2f}',f'{track:.0f}',str(len(actions)),f'{cost:.2f}']):
@@ -195,27 +222,29 @@ def open_planner(window):
         status.setText('Searching route alternatives…'); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             destination[:] = [start.x+x.value()*scale,start.y+y.value()*scale]
-            direct = generate_direct_candidates(start,destination,scale)
             blocked=[o for kind,o in obstacle_items if kind in ("Static obstacle","Barrier") or (movable.isChecked() and kind not in ("Target zone","Terrain region","Grid / matrix","Colour marker"))]
             checker=CollisionChecker(footprint,blocked,scale,bounds=(0,0,width-1,height-1),margin_mm=margin.value()) if check.isChecked() else None
             if checker is not None:
                 initial_hit=checker.check_pose(start)
                 if initial_hit:
                     choices.clear(); populate(); status.setText(f"Starting footprint violates clearance: {initial_hit.obstacle}. Adjust start, objects or clearance."); return
-            hybrid = generate_hybrid_candidates(start,destination,graph,canvas.robot,max_pairs=budget.currentData(),sensor_aware=True,line_width_mm=line_width.value(),edge_validator=validator if raster.isChecked() else None,collision_checker=checker)
-            direct=[a for a in direct if checker is None or checker.check_route(start,a) is None]
-            detours=[]
-            if not direct and not hybrid and checker is not None:
-                detours=generate_detour_candidates(start,destination,scale,checker)
-            def score(routes, detour=False):
-                result=[]
-                for actions in routes:
-                    track=sum(abs(a.distance) for a in actions if isinstance(a,LineTrack))
-                    label='Detour' if detour else ('Hybrid' if track else ('Reverse' if any(isinstance(a,Drive) and a.distance<0 for a in actions) else 'Forward'))
-                    result.append((evaluate_candidate(start,actions,canvas.robot,scale),estimate_execution_time(actions,canvas.robot),actions,track,label))
-                return sorted(result,key=lambda c:c[0])
-            choices[:] = sorted(score(direct)+score(hybrid)[:30]+score(detours)[:12],key=lambda c:c[0])
-            status.setText((f'{len(direct)} direct · {len(hybrid)} hybrid · {len(detours)} detour candidates. Showing the best alternatives.' + (' Collision checks OFF.' if checker is None else '')) if choices else 'No feasible candidate found. Try deeper search, a different destination, or verify line width, robot footprint and obstacle placement. Single-corner detours are limited.')
+            routes = generate_navigation_alternatives(
+                start,destination,canvas.robot,scale,graph=graph,
+                collision_checker=checker,max_pairs=budget.currentData(),
+                prefer_line_tracking=preference.isChecked(),
+                sensor_aware=True,line_width_mm=line_width.value(),
+                edge_validator=validator if raster.isChecked() else None)
+            choices.clear()
+            for label, actions in routes:
+                track=sum(abs(a.distance) for a in actions if isinstance(a,LineTrack))
+                choices.append((evaluate_candidate(start,actions,canvas.robot,scale,
+                                               prefer_line_tracking=preference.isChecked()),
+                                estimate_execution_time(actions,canvas.robot),actions,track,label))
+            counts={name:sum(1 for c in choices if c[4]==name) for name in ('Forward','Reverse','L-shaped','Detour','Line-augmented','Intersection track','Junction corner','Opportunistic track','Hybrid','Shortcut')}
+            status.setText((" · ".join(f"{n} {name.lower()}" for name,n in counts.items() if n)
+                            + ". Ranked by draft navigation cost (uncertainty not yet modelled)."
+                            + (" Collision checks OFF." if checker is None else ""))
+                           if choices else 'No feasible route found. Try a different destination, inspect field objects, or adjust the clearance. The detour search is still limited.')
             populate()
         except Exception as exc:
             choices.clear(); populate(); status.setText(f'Planning failed: {exc}')
@@ -247,7 +276,7 @@ def open_planner(window):
     x.valueChanged.connect(invalidate); y.valueChanged.connect(invalidate); budget.currentIndexChanged.connect(invalidate)
     auto.toggled.connect(lambda on: timer.start() if on and not choices else timer.stop())
     filter_box.currentIndexChanged.connect(populate); table.itemSelectionChanged.connect(display)
-    for control in (check,movable,raster): control.toggled.connect(invalidate)
+    for control in (check,movable,raster,preference): control.toggled.connect(invalidate)
     for control in (margin,line_width): control.valueChanged.connect(invalidate)
     generate.clicked.connect(run); timer.timeout.connect(run); apply.clicked.connect(commit); close.clicked.connect(dialog.reject)
     copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(editor.toPlainText()))

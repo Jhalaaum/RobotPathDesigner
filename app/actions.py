@@ -49,6 +49,17 @@ class LineTrack:
 
 
 @dataclass(frozen=True)
+class TrackToIntersection(LineTrack):
+    """Planner-only: known nominal chassis travel to a REAL track junction.
+
+    Emits a sensor-controlled stop in Pybricks; distance is only for desktop
+    prediction/collision checking, not a robot stop distance. Do not use it if
+    there is an unmodelled earlier intersection along the tracking section.
+    """
+    kind: ClassVar[str] = 'track_to_intersection'
+
+
+@dataclass(frozen=True)
 class TrackUntilIntersection:
     side: str = 'right'
     count: int = 1
@@ -97,8 +108,8 @@ class Wait:
             raise ValueError('Wait requires nonnegative integer milliseconds')
 
 
-Action = Union[Drive, Turn, LineTrack, TrackUntilIntersection, MotorAction, Wait]
-_TYPES = {cls.kind: cls for cls in (Drive, Turn, LineTrack, TrackUntilIntersection, MotorAction, Wait)}
+Action = Union[Drive, Turn, LineTrack, TrackToIntersection, TrackUntilIntersection, MotorAction, Wait]
+_TYPES = {cls.kind: cls for cls in (Drive, Turn, LineTrack, TrackToIntersection, TrackUntilIntersection, MotorAction, Wait)}
 
 
 @dataclass(frozen=True)
@@ -127,7 +138,9 @@ class Program:
 
 
 def fmt(value):
-    return repr(value) if not float(value).is_integer() else str(int(value))
+    """Compact output for editable competition code (not a measurement claim)."""
+    value = round(float(value), 2)
+    return str(int(value)) if value.is_integer() else f'{value:.2f}'.rstrip('0').rstrip('.')
 
 
 def to_pybricks(program, motors=None):
@@ -139,8 +152,11 @@ def to_pybricks(program, motors=None):
             lines.append(f'{a.method}DriveStraight({fmt(a.distance)})')
         elif isinstance(a, Turn):
             lines.append(f'turn({fmt(a.angle)})')
+        elif isinstance(a, TrackToIntersection):
+            side = 'side="left"' if a.side == 'left' else ''
+            lines.append(f'singleLineTrackTillIntersection({side})')
         elif isinstance(a, LineTrack):
-            side = ', side="left"' if a.side == 'left' else ''
+            side = ', side="left"'  if a.side == 'left' else ''
             lines.append(f'singleLineTrackByDist({fmt(a.distance)}{side})')
         elif isinstance(a, TrackUntilIntersection):
             if a.count != 1:
@@ -211,6 +227,14 @@ def to_movements(program, intersection_distance_mm=200.0, auto_intersections=Fal
     for i, a in enumerate(program.actions, 1):
         if isinstance(a, Turn):
             movements.append({'type':'turn','angle':float(a.angle)})
+        elif isinstance(a, TrackToIntersection):
+            # Preserve known *nominal* planning geometry when applying to GUI.
+            # Actual sensor stop is variable; do not force auto re-detection.
+            movements.append(dict(type='line', distance=float(a.distance),
+                                  stop='Intersection', side=a.side,
+                                  estimated=True, source_line=i,
+                                  auto_detect=False))
+            warnings.append(f'Action {i}: junction stop uses nominal {a.distance:.1f} mm for preview only.')
         elif isinstance(a, TrackUntilIntersection):
             if a.count != 1: raise ValueError('Canvas adapter currently supports one intersection per action')
             if number(intersection_distance_mm) <= 0: raise ValueError('Positive intersection estimate required')
